@@ -66,6 +66,26 @@ async def test_end_to_end_frozen_evidence_publish_five_buys_and_next_day_sell(en
 
 
 @pytest.mark.asyncio
+async def test_non_trading_day_does_not_create_analysis_or_audit_rows(env, monkeypatch):
+    env.clock.at = local("2026-09-25T09:50:10+08:00")
+    checked = []
+
+    def closed(at):
+        checked.append(at)
+        return False
+
+    monkeypatch.setattr(env.market, "is_trading_day", closed)
+    assert await env.service.analyze() is None
+    assert await env.service.analyze() is None
+    assert len(checked) == 1
+    assert not env.service.repo.rows("analysis_runs")
+    with env.db.connection() as connection:
+        assert connection.execute("SELECT count(*) FROM research_audit_run_states").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM research_evidence_sets").fetchone()[0] == 0
+    assert not env.ai.calls
+
+
+@pytest.mark.asyncio
 async def test_publication_uses_write_lock_time_and_first_report_wins(env):
     async def late():
         env.clock.at = local("2026-09-24T09:55:01+08:00")

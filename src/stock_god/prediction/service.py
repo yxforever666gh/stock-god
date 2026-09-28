@@ -62,6 +62,7 @@ class PredictionService:
         self._last_metric = None
         self._chart_locks = {}
         self._chart_cache = {}
+        self._non_trading_date = None
         if evidence_store is None:
             from .evidence_store import EvidenceStore
 
@@ -124,6 +125,13 @@ class PredictionService:
                 raise Conflict("不在允许启动分析的上午窗口")
             if not diagnostic and not snapshot.config.get("predictionAutoEnabled", True):
                 raise Conflict("股票预测自动策略已关闭")
+            if self._non_trading_date == scheduled.date() or not await asyncio.to_thread(
+                market.is_trading_day, scheduled
+            ):
+                self._non_trading_date = scheduled.date()
+                if parent_run_id:
+                    raise Conflict("非交易日不执行分析")
+                return None
             trigger = (
                 "diagnostic"
                 if diagnostic
@@ -140,20 +148,6 @@ class PredictionService:
             attempts = []
             try:
                 self.audit.begin(identity)
-                if not await asyncio.to_thread(market.is_trading_day, scheduled):
-                    self.repo.set(
-                        "analysis_runs",
-                        {
-                            "status": "skipped_non_trading_day",
-                            "generated_at": stamp(self.clock()),
-                            "failure_reason": "今日不是A股正常交易日，不执行选股。",
-                            "report_markdown": "今日不是A股正常交易日，不执行选股。",
-                        },
-                        "run_id=?",
-                        (identity,),
-                    )
-                    self.audit.complete(identity)
-                    return self.views.run(identity)
                 evidence_id = self.evidence_store.begin(identity, now)
                 self.repo.set("analysis_runs", {"evidence_set_id": evidence_id}, "run_id=?", (identity,))
                 try:
@@ -693,7 +687,13 @@ class PredictionService:
         snapshot = self._snapshot()
         pulse = now.replace(second=0 if now.second < 5 else 5, microsecond=0)
         new_pulse = pulse != self._last_trade
-        if slot and now.weekday() < 5 and snapshot.config.get("predictionAutoEnabled", True) and new_pulse:
+        if (
+            slot
+            and now.weekday() < 5
+            and self._non_trading_date != now.date()
+            and snapshot.config.get("predictionAutoEnabled", True)
+            and new_pulse
+        ):
             key = now.date().isoformat() + ":" + slot
             if key not in self._tasks:
                 self._launch(key, self._scheduled_analysis(slot_time(now, slot)))

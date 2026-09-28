@@ -292,7 +292,24 @@ def recommendation_chart(repository, market, identity, refresh):
     quote = {}
     try:
         loader = market.bars if refresh else market.cached_bars
-        raw = loader(item["stock_code"], start - timedelta(days=10), end, period="1m", adjustment="none")
+        raw = loader(
+            item["stock_code"],
+            start if refresh else start - timedelta(days=10),
+            end,
+            period="1m",
+            adjustment="none",
+        )
+        if refresh:
+            try:
+                raw = market.cached_bars(
+                    item["stock_code"],
+                    start - timedelta(days=10),
+                    start - timedelta(minutes=1),
+                    period="1m",
+                    adjustment="none",
+                ) + raw
+            except (OSError, ValueError, RuntimeError):
+                pass  # Prior close is optional; refreshed holding-period bars remain usable.
     except (OSError, ValueError, RuntimeError) as error:
         errors.append({"provider": "minutes", "message": str(error)})
         if refresh:
@@ -307,7 +324,9 @@ def recommendation_chart(repository, market, identity, refresh):
             quote = market.quote(item["stock_code"])
         except (OSError, ValueError, RuntimeError) as error:
             errors.append({"provider": "quote", "message": str(error)})
-    all_bars = sorted((bar for bar in raw if valid_bar(bar)), key=bar_time)
+    all_bars = sorted(
+        {bar_time(bar): bar for bar in raw if valid_bar(bar)}.values(), key=bar_time
+    )
     bars = []
     for bar in all_bars:
         at = bar_time(bar)

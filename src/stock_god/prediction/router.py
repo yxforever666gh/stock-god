@@ -74,8 +74,6 @@ def create_router(service):
 
     @router.get("/recommendations/{id}", operation_id="getPredictionRecommendation")
     async def recommendation(id: str):
-        item = call(service.repo.row, "recommendations", "recommendation_id=?", (id,))
-        await service.refresh_quotes([item])
         return call(service.get_recommendation, id)
 
     @router.get("/recommendations/{id}/chart", operation_id="getPredictionRecommendationChart")

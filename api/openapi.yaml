@@ -964,6 +964,7 @@ paths:
   /api/v1/prediction/recommendations/{id}:
     get:
       operationId: getPredictionRecommendation
+      description: Reads the stored recommendation detail without waiting for an upstream quote.
       responses:
         '200':
           description: stock prediction recommendation detail

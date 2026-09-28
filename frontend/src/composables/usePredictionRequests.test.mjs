@@ -96,6 +96,9 @@ test('late cache results cannot replace a new stock after it has refreshed', asy
   const chart = scope.run(() => usePredictionChart(key => key === 'a' ? cacheA.promise : Promise.resolve({id: key}), async key => { refreshKeys.push(key); return {id: `${key}-new`} }))
   const first = chart.load('a')
   await chart.load('b')
+  assert.equal(chart.chartData.value.id, 'b')
+  assert.deepEqual(refreshKeys, [])
+  await chart.refresh()
   cacheA.resolve({id: 'a'}); await first
   assert.equal(chart.chartData.value.id, 'b-new')
   assert.deepEqual(refreshKeys, ['b'])
@@ -108,11 +111,14 @@ test('chart identity change discards old cache and releases old refresh loading'
   const chart = scope.run(() => usePredictionChart(key => key === 'a' ? cacheA.promise : Promise.resolve({id: key}), key => key === 'a' ? refreshA.promise : refreshB.promise))
   const first = chart.load('a')
   cacheA.resolve({id: 'a'}); await flush()
+  await first
+  const oldRefresh = chart.refresh(); await flush()
   assert.equal(chart.refreshing.value, true)
-  const second = chart.load('b'); await flush()
-  refreshA.resolve({id: 'a-refreshed'}); await first
+  const second = chart.load('b'); await second
+  refreshA.resolve({id: 'a-refreshed'}); await oldRefresh
   assert.equal(chart.chartData.value.id, 'b')
-  refreshB.resolve({id: 'b-refreshed'}); await second
+  const newRefresh = chart.refresh(); await flush()
+  refreshB.resolve({id: 'b-refreshed'}); await newRefresh
   assert.equal(chart.chartData.value.id, 'b-refreshed')
   assert.equal(chart.refreshing.value, false)
   scope.stop()

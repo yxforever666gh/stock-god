@@ -104,7 +104,6 @@ export function usePredictionChart(readChart, refreshChart) {
     } finally {
       if (request.current(version)) initialLoading.value = false
     }
-    if (request.current(version)) await refresh()
   }
   return {chartData, initialLoading, refreshing, cacheError, refreshError, load, refresh}
 }

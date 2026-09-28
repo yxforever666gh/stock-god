@@ -117,7 +117,7 @@ watch(() => props.recommendationId, id => {
     </n-spin>
     <n-flex justify="space-between" class="chart-footnote">
       <n-text depth="3">图表状态仅表示分钟数据覆盖情况；卖出检查与 AI 调用结果见下方时间线。十字光标保留量价来源及扣费净收益，真实成交标记保持不变。</n-text>
-      <n-text depth="3">行情时点 {{ String(chartData?.quoteAt || '--').replace('T', ' ').slice(0, 19) }} · 采集于 {{ String(chartData?.refreshedAt || '--').replace('T', ' ').slice(0, 19) }}</n-text>
+      <n-text depth="3">默认读取本地分钟缓存，点击“刷新行情”获取最新数据。行情时点 {{ String(chartData?.quoteAt || '--').replace('T', ' ').slice(0, 19) }} · 读取于 {{ String(chartData?.refreshedAt || '--').replace('T', ' ').slice(0, 19) }}</n-text>
     </n-flex>
   </section>
 </template>

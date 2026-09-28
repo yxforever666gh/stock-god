@@ -90,6 +90,33 @@ async def test_chart_cached_get_never_calls_providers_and_returns_fee_net_pnl(en
     assert env.market.network_calls == 2
 
 
+@pytest.mark.asyncio
+async def test_chart_refresh_requests_holding_range_and_keeps_cached_prior_close(env, monkeypatch):
+    await env.service.analyze()
+    await env.service.process_trades()
+    item = env.service.repo.rows("recommendations", "buy_at IS NOT NULL")[0]
+    rows = [
+        bar(local("2026-09-23T15:00:00+08:00"), 9.5),
+        bar(local("2026-09-24T09:30:00+08:00"), 10),
+        bar(local("2026-09-24T09:50:00+08:00"), 10.5),
+    ]
+    requested = []
+
+    def select(code, start, end, **kwargs):
+        return [row for row in rows if start <= local(row["time"]) <= end]
+
+    def fresh(code, start, end, **kwargs):
+        requested.append((start, end))
+        return select(code, start, end, **kwargs)
+
+    monkeypatch.setattr(env.market, "bars", fresh)
+    monkeypatch.setattr(env.market, "cached_bars", select)
+    chart = await env.service.chart(item["recommendation_id"], True)
+    assert requested[0][0].date() == local(item["signal_at"]).date()
+    assert chart["sessions"][0]["previousClose"] == 9.5
+    assert len(chart["bars"]) == 2
+
+
 async def test_failed_chart_refresh_preserves_real_partial_cache_and_trade_markers(env, monkeypatch):
     await env.service.analyze()
     await env.service.process_trades()
