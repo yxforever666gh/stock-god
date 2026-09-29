@@ -1,6 +1,6 @@
 [project]
 name = "stock-god"
-version = "6.0.3"
+version = "6.0.4"
 description = "Stock prediction and market data services"
 requires-python = ">=3.13,<3.14"
 dependencies = [

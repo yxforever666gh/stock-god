@@ -351,6 +351,42 @@ def test_stop_accepts_503_identity_and_waits_for_non_listening_database_writer(t
     assert not any(world.live.values())
 
 
+def test_ensure_keeps_a_healthy_release_and_starts_a_stopped_one(tmp_path, monkeypatch):
+    _, pointer = candidate(tmp_path)
+    world = ProcessWorld(tmp_path, pointer, monkeypatch, ready=True)
+    started = release.ensure_running(pointer, tmp_path)
+    assert started["action"] == "started" and started["ready"]["pid"] == 101
+    assert release.ensure_running(pointer, tmp_path)["action"] == "healthy"
+    assert not world.terminated and all(world.live.values())
+
+
+def test_ensure_restarts_an_owned_release_that_is_not_ready(tmp_path, monkeypatch):
+    _, pointer = candidate(tmp_path)
+    world = ProcessWorld(tmp_path, pointer, monkeypatch, ready=True)
+    release.start(pointer, tmp_path)
+    world.ready = False
+    original_spawn = world.spawn
+
+    def recovered_spawn(*args, **kwargs):
+        world.ready = True
+        world.bound = True
+        return original_spawn(*args, **kwargs)
+
+    monkeypatch.setattr(release, "spawn_owned", recovered_spawn)
+    result = release.ensure_running(pointer, tmp_path)
+    assert result["ready"]["readiness"]["ready"]
+    assert set(world.terminated) == {100, 101}
+
+
+def test_ensure_never_kills_an_unknown_listener(tmp_path, monkeypatch):
+    _, pointer = candidate(tmp_path)
+    world = ProcessWorld(tmp_path, pointer, monkeypatch, ready=True)
+    monkeypatch.setattr(release, "listener_pid", lambda: 999)
+    with pytest.raises(RuntimeError, match="not an owned release process"):
+        release.ensure_running(pointer, tmp_path)
+    assert not world.terminated and not world.started
+
+
 def test_reused_pid_is_not_an_owned_python_listener(tmp_path, monkeypatch):
     _, pointer = candidate(tmp_path)
     world = ProcessWorld(tmp_path, pointer, monkeypatch, ready=True)

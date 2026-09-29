@@ -826,6 +826,30 @@ def start(pointer, root=ROOT, *, scheduler=True):
         raise
 
 
+def ensure_running(pointer, root=ROOT):
+    """Keep a healthy owned release, otherwise restart only processes we can identify."""
+    was_listening = listening()
+    if was_listening:
+        try:
+            state = request()
+        except (OSError, ValueError):
+            pass  # stop() must still prove ownership before touching this listener.
+        else:
+            record = process_record(root)
+            owners = (
+                owned_processes(record)
+                if record and pointer_key(record["pointer"]) == pointer_key(pointer)
+                else []
+            )
+            assert_native_identity(pointer, state, owners, root)
+            assert_identity(pointer, state, require_ready=False, root=root)
+            if state.get("readiness", {}).get("ready"):
+                return {"action": "healthy", "ready": state}
+    stop(pointer, root)
+    stop_maintenance(root)
+    return {"action": "restarted" if was_listening else "started", "ready": start(pointer, root)}
+
+
 def validate_proof(path, pointer):
     path = Path(path).resolve()
     proof = read(path)
@@ -1124,7 +1148,7 @@ def main(argv=None):
     rollback = commands.add_parser("rollback")
     rollback.add_argument("--receipt", type=Path, required=True)
     commands.add_parser("recover")
-    for name in ("start", "stop", "restart", "status"):
+    for name in ("start", "stop", "restart", "status", "ensure"):
         commands.add_parser(name)
     args = parser.parse_args(argv)
     root = args.root.resolve()
@@ -1141,7 +1165,7 @@ def main(argv=None):
         elif args.command == "recover":
             result = recover_pending(root) or {"status": "no_pending_deployment"}
         else:
-            if args.command in {"start", "restart"}:
+            if args.command in {"start", "restart", "ensure"}:
                 recover_pending(root)
             pointer = verify_pointer(read(root / "runtime/current.json"), root)
             if args.command in {"stop", "restart"}:
@@ -1151,7 +1175,9 @@ def main(argv=None):
                         pointer = record["pointer"]
                 stop(pointer, root)
                 stop_maintenance(root)
-            if args.command in {"start", "restart"}:
+            if args.command == "ensure":
+                result = ensure_running(pointer, root)
+            elif args.command in {"start", "restart"}:
                 result = start(pointer, root)
             elif args.command == "status" and listening():
                 result = request()

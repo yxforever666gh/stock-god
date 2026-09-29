@@ -34,6 +34,14 @@ pwsh -File scripts/release.ps1 -Command stop
 
 启动器跟随已核验的发布指针。`/livez` 表示进程存活，`/readyz` 同时提供迁移、服务、调度就绪及版本/commit/制品哈希；关于页面展示后端返回的真实版本。
 
+开盘前恢复由当前用户的 Windows 计划任务 `StockGod-0900-EnsureRunning` 承载。首次在本机注册：
+
+```powershell
+pwsh -NoProfile -File scripts/ensure-running.ps1 -Mode Install
+```
+
+任务每天 09:00 检查一次已部署版本；正常时不重启，停止或已归属但不就绪时安全重启，未知监听进程不会被终止。它仅在当前用户登录或锁屏时运行，允许电池供电，不主动唤醒电脑；睡眠错过时醒来后补执行可能延迟。任务进程保持运行并在下一天 09:00 再检查；日内再次退出要手动处理。结果写入 `runtime/logs/ensure-running.log`。部署完成后应先停止由部署命令启动的服务，再通过 `Start-ScheduledTask -TaskName StockGod-0900-EnsureRunning` 从任务宿主启动正式服务，并核对 `/readyz` 与任务状态。
+
 ## 持久数据与临时文件
 
 | 内容 | 默认位置或配置 |
