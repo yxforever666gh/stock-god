@@ -538,7 +538,7 @@ def render_report(run, items, evidence, output, warnings):
         f"- 推荐数量：{len(items)}",
         f"- 当日尝试：第{run['attempt_no']}次",
         f"- 计划区间：{run['scheduled_slot']}",
-        f"- 落盘区间：{run['slot'] or '--'}",
+        f"- 启动所属区间：{run['slot'] or '--'}",
         f"- 实际启动：{run['started_at']}",
         f"- 报告生成：{run['generated_at']}",
         f"- 市场快照时点：{run['evidence_cutoff_at']}",

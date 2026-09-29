@@ -31,7 +31,7 @@ const type = status => status === 'success' ? 'success' : status === 'failed' ? 
 const show = row => detailRequest.show(row.runId)
 const columns = [
  {title: '计划区间', key: 'scheduledSlot', width: 100},
- {title: '落盘区间', key: 'slot', width: 100, render: row => row.slot || '--'},
+ {title: '所属区间', key: 'slot', width: 100, render: row => row.slot || '--'},
  {title: '展示状态', key: 'published', width: 120, render: row => row.published ? '区间首份报告' : row.status === 'running' ? '运行中' : '仅保留报告'},
  {title: '归档原因', key: 'archiveReason', minWidth: 200},
   {title: '交易日', key: 'tradingDate', width: 110},
@@ -80,7 +80,7 @@ onBeforeUnmount(() => { requestVersion++ })
 
 <template>
   <n-space vertical>
-    <n-alert type="info" :bordered="false">09:30至11:25每五分钟独立启动。成功按落盘时间归区间，先到先得；后到及11:30后完成的报告仅归档。买入跟随有效推荐，卖出由各账户的定时任务独立执行。</n-alert>
+    <n-alert type="info" :bordered="false">09:30至11:25每五分钟独立启动。报告按实际启动时间归区间，同区间先完成者取得发布权；11:30后完成的报告仅归档。买入跟随有效推荐，卖出由各账户的定时任务独立执行。</n-alert>
     <n-checkbox v-model:checked="allReports">全部报告（包含失败、后到和午休后报告）</n-checkbox>
     <n-flex justify="end"><n-button :loading="loading" @click="refresh">刷新</n-button></n-flex>
     <n-alert v-if="listError" type="error" :bordered="false">{{ listError }}</n-alert>

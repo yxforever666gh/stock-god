@@ -178,7 +178,8 @@ test('prediction report explains the one-report daily limit and does not offer a
     }
     const source = await readFile(new URL('predictionReport.vue', import.meta.url), 'utf8')
     assert.match(source, /09:30至11:25每五分钟独立启动/)
-    assert.match(source, /成功按落盘时间归区间/)
+    assert.match(source, /报告按实际启动时间归区间/)
+    assert.equal(state.columns.find(column => column.key === 'slot').title, '所属区间')
     assert.match(source, /卖出由各账户的定时任务独立执行/)
     assert.doesNotMatch(source, /主选|候选|补位|主备|主\/备|09:55/)
     assert.match(source, /}, 5000,/)

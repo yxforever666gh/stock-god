@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from .common import (
@@ -600,30 +601,36 @@ class Charts(ProviderState):
 
     def _private_bars(self, code, start, end, deadline=None):
         base = str(self.settings.get("privateMinuteBaseUrl") or "https://mg.diemeng.chat/api").rstrip("/")
+        parsed = urlsplit(base)
+        if parsed.hostname in {"diemeng.chat", "mg.diemeng.chat"}:
+            base = urlunsplit(parsed._replace(netloc="data.diemeng.chat"))
         result = []
         private_timeout = float(self.settings.get("privateMinuteTimeoutSec") or 60)
-        for page in range(1, 51):
+        page_size = 10000
+        for page in range(50):
             remaining = remaining_seconds(deadline)
             payload = self.http.json(
                 base + "/stock/history",
                 method="POST",
                 headers={"apiKey": self.settings.get("privateMinuteApiKey", "")},
                 body={
-                    "stock_code": code[2:],
+                    "stock_code": code[2:] + "." + code[:2].upper(),
                     "level": "1min",
                     "start_time": start.strftime("%Y-%m-%d %H:%M:%S"),
                     "end_time": end.strftime("%Y-%m-%d %H:%M:%S"),
                     "page": page,
-                    "page_size": 5000,
+                    "page_size": page_size,
                 },
                 timeout=min(private_timeout, remaining) if remaining is not None else private_timeout,
             )
             if payload.get("code", 0) not in (0, 200):
                 raise MarketDataError("private minute provider rejected request")
             data = payload.get("data") or {}
-            items = data.get("items", data.get("list"))
+            items = data.get("list", data.get("items"))
             if not isinstance(items, list):
                 raise MarketDataError("private minute data has no items")
+            if not items and page == 0 and int(data.get("total", 0)) > 0:
+                raise MarketDataError("private minute first page is empty")
             for row in items:
                 result.append(
                     {
@@ -631,12 +638,15 @@ class Charts(ProviderState):
                         **{
                             key: number(row.get(key), 0) for key in ("open", "high", "low", "close", "amount")
                         },
-                        "volume": number(row.get("vol"), 0),
+                        "volume": float(number(row.get("vol"), 0)) * 100,
                         "source": "private-minute:none",
                     }
                 )
-            if len(result) >= int(data.get("total", len(result))) or not items:
+            if len(result) >= int(data.get("total", len(result))) or len(items) < page_size:
                 return valid_bars(result, start, end)
+            interval = float(self.settings.get("privateMinuteMinIntervalMs") or 0) / 1000
+            if interval > 0:
+                time.sleep(interval)
         raise MarketDataError("private minute pagination exceeded 50 pages")
 
     def bars(self, code, start, end, period="1m", adjustment="none", limit=5000):

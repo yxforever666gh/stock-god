@@ -53,7 +53,7 @@ def candidate(root):
     return directory, release.verify_bundle(directory, root=root)
 
 
-def snapshot_candidate(root, *, version="6.0.7", commit="snapshot-commit", schema=36):
+def snapshot_candidate(root, *, version="6.0.8", commit="snapshot-commit", schema=36):
     directory = root / "runtime/releases" / version / commit
     (directory / "src/stock_god").mkdir(parents=True)
     (directory / "frontend/dist").mkdir(parents=True)
@@ -443,6 +443,34 @@ def test_failed_upgrade_restores_both_databases_and_old_pointer(tmp_path, monkey
     assert receipt["status"] == "rolled_back"
     assert len(receipt["backups"]) == 2
     assert list(Path(receipt["directory"]).glob("restore-*/failed-stock.db"))
+
+
+def test_explicit_slot_correction_failure_restores_both_backups_before_activation(tmp_path, monkeypatch):
+    directory, _ = snapshot_candidate(tmp_path, version="6.0.7")
+    before = legacy(tmp_path)
+    fixture_databases(tmp_path)
+    proof = snapshot_proof(tmp_path, directory)
+    correction = tmp_path / "correction-plan.json"
+    correction.write_text("fixture", encoding="utf-8")
+    monkeypatch.setattr(release, "CORRECTION_PLAN_PATH", correction)
+    monkeypatch.setattr(release, "database_backup_required", lambda *args: True)
+    monkeypatch.setattr(release, "listener_pid", lambda: None)
+    monkeypatch.setattr(release, "stop", lambda *args: None)
+    monkeypatch.setattr(release, "start", lambda *args, **kwargs: {"readiness": {"ready": True}})
+    monkeypatch.setattr(release, "database_command", lambda *args: '{"ok": true}')
+
+    def failed_correction(*args):
+        with Database(tmp_path / "data/stock.db").transaction() as db:
+            db.execute("UPDATE records SET value='partial correction'")
+        raise ValueError("correction evidence mismatch")
+
+    monkeypatch.setattr(release, "candidate_command", failed_correction)
+    with pytest.raises(ValueError, match="correction evidence mismatch"):
+        release.deploy(directory, proof, tmp_path, correction, release.digest(correction))
+    assert database_values(tmp_path) == ["original", "original"]
+    assert release.read(tmp_path / "runtime/current.json") == before
+    receipt = release.read(next((tmp_path / "runtime/deployments").glob("*/receipt.json")))
+    assert receipt["status"] == "rolled_back" and receipt["correctionPlanSHA256"] == release.digest(correction)
 
 
 def test_running_identity_rejects_stale_python_and_wrong_commit(tmp_path):

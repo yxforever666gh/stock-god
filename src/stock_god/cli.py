@@ -2,6 +2,8 @@
 
 import argparse
 import asyncio
+import hashlib
+import json
 import logging
 import os
 from contextlib import contextmanager
@@ -98,6 +100,70 @@ async def prediction_command(config, operation, dry_run=True):
         database.close()
 
 
+def start_slot_command(config, plan_path, plan_sha256, apply):
+    from .audit import AuditStore
+    from .market.replay_inputs import OfflineReplayMarket, hydrate_private_minutes, verified_replay_evidence
+    from .prediction.replay import AllocationReplay
+    from .prediction.repository import Repository
+    from .prediction.slot_correction import StartSlotCorrection
+    from .settings import SettingsStore
+    from .storage.db import Database
+
+    plan, files = verified_replay_evidence(plan_path, plan_sha256)
+    if plan["version"] != release_manifest()["appVersion"]:
+        raise ValueError("correction plan version differs from the candidate")
+    database = Database(config.main_db)
+    repository = Repository(database)
+    correction = StartSlotCorrection(repository, AuditStore(database))
+    try:
+        draft = correction.plan()
+        if draft["planHash"] != plan["correctionPlanHash"]:
+            raise ValueError("production correction plan differs from the verified copies")
+        if not apply:
+            return {"planHash": draft["planHash"], "dryRun": True}
+        hydrate_private_minutes(config.minute_db, files["minuteDbSHA256"])
+        corrected = correction.apply(draft, expected_hash=plan["correctionPlanHash"])
+        market = OfflineReplayMarket(
+            config, SettingsStore(database).load().config,
+            files["calendarSHA256"], files["dailyManifestSHA256"],
+        )
+        try:
+            replay = AllocationReplay(repository, market)
+            expected = json.loads(files["financialResultSHA256"].read_text(encoding="utf-8"))
+            preview = replay.run(True)
+            if (preview["planHash"] != plan["replayPlanHash"] or
+                preview["missingSellCount"] or
+                preview["missingBuyCount"] != expected["missingBuyCount"] or
+                any(gap["phase"] != "buy" or not any(
+                    word in gap["reason"] for word in ("涨停", "跌停")
+                ) for gap in preview["missing"])):
+                raise ValueError("financial replay differs or lacks necessary market evidence")
+            result = replay.run(False)
+            if (result["planHash"] != expected["planHash"] or
+                result["accountCash"] != expected["accountCash"] or
+                result["buyCount"] != expected["buyCount"] or
+                result["sellCount"] != expected["sellCount"]):
+                raise ValueError("applied financial result differs from offline copies")
+            for table, known in plan["financialFingerprints"].items():
+                rows = [
+                    {key: value for key, value in row.items() if key not in
+                     ("id", "created_at", "updated_at")}
+                    for row in repository.rows(table.removeprefix("research2_"))
+                ]
+                digest = hashlib.sha256(json.dumps(
+                    rows, sort_keys=True, ensure_ascii=False, default=str,
+                    separators=(",", ":"),
+                ).encode()).hexdigest()
+                if len(rows) != known["count"] or digest != known["sha256"]:
+                    raise ValueError("applied financial table differs: " + table)
+            return {"correction": corrected, "replayPlanHash": result["planHash"],
+                    "tradeRows": result["buyCount"] + result["sellCount"], "verified": True}
+        finally:
+            market.close()
+    finally:
+        database.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="stock-god")
     parser.add_argument("--root", type=Path, help="Persistent project root (data/runtime stay inside)")
@@ -126,6 +192,10 @@ def main(argv=None):
     replay.add_argument(
         "--apply", action="store_true", help="Apply the verified replay; default only plans it"
     )
+    correction = prediction_commands.add_parser("correct-start-slots")
+    correction.add_argument("--plan-file", type=Path, required=True)
+    correction.add_argument("--plan-sha256", required=True)
+    correction.add_argument("--apply", action="store_true")
     commands.add_parser("version")
     args = parser.parse_args(argv)
     config = AppConfig.from_env(args.root)
@@ -171,9 +241,12 @@ def main(argv=None):
             else:
                 result = extra_commands.execute(args, config)
         elif args.command == "prediction":
-            result = asyncio.run(
-                prediction_command(config, args.operation, not getattr(args, "apply", False))
-            )
+            if args.operation == "correct-start-slots":
+                result = start_slot_command(config, args.plan_file, args.plan_sha256, args.apply)
+            else:
+                result = asyncio.run(
+                    prediction_command(config, args.operation, not getattr(args, "apply", False))
+                )
         else:
             result = extra_commands.execute(args, config)
         output = extra_commands.format_result(args, result)

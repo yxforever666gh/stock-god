@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+CORRECTION_PLAN_PATH = Path("H:/Download/stock-god-6.0.7/correction-plan.json")
 sys.path.insert(0, str(ROOT / "src"))
 
 from stock_god.cli import process_lock  # noqa: E402
@@ -777,7 +778,7 @@ def assert_identity(pointer, state, *, require_ready=True, root=None):
             raise RuntimeError("running persistent root mismatch")
 
 
-START_TIMEOUT = 60
+START_TIMEOUT = 120
 STOP_TIMEOUT = 30
 
 
@@ -1077,19 +1078,23 @@ def validate_proof(path, pointer):
     return proof
 
 
-def database_command(pointer, root, command):
-    label = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + command
-    args = [pointer["pythonExecutable"], "-B", "-P", "-m", "stock_god", "db", command]
+def candidate_command(pointer, root, name, arguments):
+    label = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + name
+    args = [pointer["pythonExecutable"], "-B", "-P", "-m", "stock_god", *arguments]
     child, job, record = spawn_owned(
         args, root, release_env(pointer, root, scheduler=False), label, pointer, "maintenance"
     )
     try:
         code = child.wait(timeout=1200)
         if code:
-            raise RuntimeError("database " + command + " failed; inspect runtime/logs/" + label + ".err.log")
+            raise RuntimeError(name + " failed; inspect runtime/logs/" + label + ".err.log")
         return (root / "runtime/logs" / (label + ".out.log")).read_text(encoding="utf-8-sig").strip()
     finally:
         cleanup_spawn(child, job, record, root, "maintenance")
+
+
+def database_command(pointer, root, command):
+    return candidate_command(pointer, root, "database-" + command, ["db", command])
 
 
 def backup_version(path):
@@ -1298,9 +1303,17 @@ def recover_pending(root, *, activate=False):
     return resume_before(receipt, root)
 
 
-def deploy_snapshot(directory, proof_path, root):
+def deploy_snapshot(directory, proof_path, root, correction_path=None, correction_sha256=None):
     candidate = verify_bundle(directory, root=root)
     proof = validate_proof(proof_path, candidate)
+    if candidate["appVersion"] == "6.0.7":
+        required = CORRECTION_PLAN_PATH.resolve()
+        if correction_path is None or Path(correction_path).resolve() != required:
+            raise ValueError("6.0.7 requires its verified start-slot correction plan")
+        if not correction_sha256 or digest(required) != correction_sha256:
+            raise ValueError("6.0.7 correction plan hash changed")
+    elif correction_path is not None or correction_sha256 is not None:
+        raise ValueError("correction plan entry applies only to 6.0.7")
     recovered = recover_pending(root)
     if recovered and recovered["status"] == "deployed" and pointer_key(
         recovered["candidate"]
@@ -1354,6 +1367,16 @@ def deploy_snapshot(directory, proof_path, root):
                     receipt["status"] = "migrating"
                     receipt_write(receipt)
                     receipt["migration"] = json.loads(database_command(candidate, root, "migrate"))
+                if correction_path is not None:
+                    receipt["status"] = "correcting"
+                    receipt["correctionPlanSHA256"] = correction_sha256
+                    receipt_write(receipt)
+                    receipt["correction"] = json.loads(candidate_command(
+                        candidate, root, "start-slot-correction",
+                        ["prediction", "correct-start-slots", "--apply", "--plan-file",
+                         str(correction_path), "--plan-sha256", correction_sha256],
+                    ))
+                    receipt_write(receipt)
                 receipt["verification"] = json.loads(database_command(candidate, root, "verify"))
                 assert_writers_stopped(root)
         write(root / "runtime/current.json", candidate)
@@ -1374,10 +1397,10 @@ def deploy_snapshot(directory, proof_path, root):
         raise
 
 
-def deploy(directory, proof_path, root):
+def deploy(directory, proof_path, root, correction_path=None, correction_sha256=None):
     if read(Path(directory) / "build-manifest.json").get("formatVersion") != 3:
         raise ValueError("older artifacts are retained for rollback only")
-    return deploy_snapshot(directory, proof_path, root)
+    return deploy_snapshot(directory, proof_path, root, correction_path, correction_sha256)
 
 
 def main(argv=None):
@@ -1398,6 +1421,8 @@ def main(argv=None):
     deployer = commands.add_parser("deploy")
     deployer.add_argument("--candidate", type=Path, required=True)
     deployer.add_argument("--proof", type=Path, required=True)
+    deployer.add_argument("--correction-plan", type=Path)
+    deployer.add_argument("--correction-sha256")
     rollback = commands.add_parser("rollback")
     rollback.add_argument("--receipt", type=Path, required=True)
     commands.add_parser("recover")
@@ -1420,7 +1445,8 @@ def main(argv=None):
         elif args.command == "proof":
             result = make_proof(args.candidate, args.evidence, args.domain, root)
         elif args.command == "deploy":
-            result = deploy(args.candidate, args.proof, root)
+            result = deploy(args.candidate, args.proof, root,
+                            args.correction_plan, args.correction_sha256)
         elif args.command == "rollback":
             path = inside(args.receipt, root / "runtime/deployments")
             result = restore(read(path), root)

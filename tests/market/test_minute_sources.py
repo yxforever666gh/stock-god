@@ -4,6 +4,7 @@ import subprocess
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from stock_god.market import MarketDataError
@@ -123,6 +124,31 @@ def test_public_chart_respects_disabled_sources_and_persisted_order(make_market,
     rows = service.bars("sh600000", at, at)
     assert rows[0]["source"] == "sina:none"
     assert calls == ["private", "sina"]
+
+
+def test_private_minutes_use_canonical_symbol_zero_page_and_share_volume(make_market):
+    at = datetime(2026, 9, 21, 10, tzinfo=CN)
+
+    def respond(request):
+        body = json.loads(request.content)
+        assert request.url.host == "data.diemeng.chat"
+        assert body["stock_code"] == "600000.SH"
+        assert body["page"] == 0 and body["page_size"] == 10000
+        return httpx.Response(200, json={
+            "code": 200,
+            "data": {"total": 1, "list": [{
+                "trade_time": "2026-09-21 10:00:00", "open": 10, "high": 11,
+                "low": 9, "close": 10, "vol": 2, "amount": 200,
+            }]},
+        })
+
+    service = make_market(handler=respond, settings={
+        "privateMinuteBaseUrl": "https://diemeng.chat/api",
+        "privateMinuteApiKey": "fixture",
+    })
+    rows = service._private_bars("sh600000", at, at)
+    assert len(rows) == 1
+    assert rows[0]["source"] == "private-minute:none" and rows[0]["volume"] == 200
 
 
 def test_recommendation_refresh_accepts_last_closed_minute_without_provider(make_market, monkeypatch):

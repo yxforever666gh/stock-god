@@ -13,16 +13,17 @@ function Write-CheckLog([string]$message) {
 }
 
 function Invoke-Check {
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     try {
         $output = & (Join-Path $PSScriptRoot 'release.ps1') -Command ensure | Out-String
         $result = $output | ConvertFrom-Json
         if (-not $result.ready.readiness.ready -or -not $result.ready.pid) {
             throw 'Release command did not return a ready process.'
         }
-        Write-CheckLog "action=$($result.action) version=$($result.ready.appVersion) pid=$($result.ready.pid)"
+        Write-CheckLog "action=$($result.action) version=$($result.ready.appVersion) pid=$($result.ready.pid) seconds=$([Math]::Round($clock.Elapsed.TotalSeconds,1))"
         return $true
     } catch {
-        Write-CheckLog "action=failed reason=$($_.Exception.Message)"
+        Write-CheckLog "action=failed seconds=$([Math]::Round($clock.Elapsed.TotalSeconds,1)) reason=$($_.Exception.Message)"
         return $false
     }
 }
@@ -59,6 +60,7 @@ if ($Mode -eq 'Once') {
 }
 
 $checkedDay = $null
+$retryAfter = [datetime]::MinValue
 while ($true) {
     $now = Get-Date
     $pendingPath = Join-Path $projectDirectory 'runtime\deployments\pending.json'
@@ -72,11 +74,15 @@ while ($true) {
             Write-CheckLog "action=pending-read-failed reason=$($_.Exception.Message)"
         }
     }
-    if ($activate -or $null -eq $checkedDay -or (
+    if (($now -ge $retryAfter) -and ($activate -or $null -eq $checkedDay -or (
         $now.Date -gt $checkedDay -and $now.TimeOfDay -ge [TimeSpan]::FromHours(9)
-    )) {
-        $checkedDay = $now.Date
-        Invoke-Check | Out-Null
+    ))) {
+        if (Invoke-Check) {
+            $checkedDay = $now.Date
+            $retryAfter = [datetime]::MinValue
+        } else {
+            $retryAfter = (Get-Date).AddMinutes(2)
+        }
     }
     Start-Sleep -Seconds 30
 }

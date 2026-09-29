@@ -160,23 +160,26 @@ class AllocationReplay:
 
     def build(self):
         now = self.repo.clock()
-        runs = {
+        successful = {
             row["run_id"]: row
             for row in self.repo.rows(
                 "analysis_runs", "status='success'", order="trading_date,julianday(generated_at),id"
             )
         }
+        runs = {identity: row for identity, row in successful.items() if row["published"]}
         if not runs:
             raise PredictionError("没有成功报告可供历史回放")
-        items = [r for r in self.repo.rows("recommendations") if r["analysis_run_id"] in runs]
+        historical_items = [r for r in self.repo.rows("recommendations") if r["analysis_run_id"] in successful]
+        items = [r for r in historical_items if r["analysis_run_id"] in runs]
         if not items:
             raise PredictionError("没有推荐记录可供历史回放")
-        known = {r["recommendation_id"] for r in items}
+        known = {r["recommendation_id"] for r in historical_items}
+        active = {r["recommendation_id"] for r in items}
         stored = {}
         for trade in self.repo.rows("trades"):
             if trade["recommendation_id"] not in known:
                 raise PredictionError("存在成功报告历史之外的交易")
-            if trade["side"] == "sell":
+            if trade["side"] == "sell" and trade["recommendation_id"] in active:
                 if trade["recommendation_id"] in stored:
                     raise PredictionError("同一推荐有多笔历史卖出")
                 stored[trade["recommendation_id"]] = trade
@@ -290,30 +293,32 @@ class AllocationReplay:
                 for state in sorted(positions, key=lambda s: (s["sellAt"], s["item"]["recommendation_id"])):
                     if state.get("attempted") or state["sellAt"] > until:
                         continue
-                    state["attempted"] = True
                     item = state["item"]
                     target = state["sellAt"]
                     try:
                         quote = self.quote(item, target, True)
                     except QuoteGap as error:
                         old = stored.get(item["recommendation_id"])
+                        old_at = local(old["traded_at"]) if old else None
                         if (
                             error.code in ("historical_minute_missing", "historical_quote_unavailable")
                             and old
                             and positive(old["market_price"])
                             and positive(old["execution_price"])
                             and old["quantity"] > 0
-                            and local(old["traded_at"]).replace(second=0, microsecond=0)
-                            == target.replace(second=0, microsecond=0)
+                            and old_at >= target
                         ):
+                            if old_at > until:
+                                continue
                             quote = {
                                 "price": old["market_price"],
-                                "at": target,
+                                "at": old_at,
                                 "quoteAt": local(old["quote_at"] or old["traded_at"]),
                                 "source": "stored_trade"
                                 + (":" + old["price_source"] if old["price_source"] else ""),
                             }
                         else:
+                            state["attempted"] = True
                             state.update(
                                 status="sell_pending",
                                 reason="历史目标卖出未重放：" + str(error),
@@ -330,6 +335,7 @@ class AllocationReplay:
                                 }
                             )
                             continue
+                    state["attempted"] = True
                     trade = make_trade(state, quote, "sell", state["buy"]["quantity"])
                     state.update(sell=trade, status="closed", reason="", failure="")
                     trades.append(trade)
@@ -452,6 +458,22 @@ class AllocationReplay:
                     "DELETE FROM research2_account_ledger_snapshots WHERE valuation_basis='capital_ledger_v1'"
                 )
                 connection.execute("DELETE FROM research2_account_daily_valuations")
+                for item in self.repo.rows(
+                    "recommendations",
+                    "analysis_run_id IN (SELECT run_id FROM research2_analysis_runs "
+                    "WHERE status='success' AND published=0)",
+                ):
+                    self._apply_state(
+                        connection,
+                        {
+                            "item": item,
+                            "status": "analysis_only",
+                            "reason": "启动区间重归属后仅保留分析",
+                            "failure": "",
+                            "blocked": False,
+                        },
+                        plan["replayId"],
+                    )
                 for state in plan["states"]:
                     self._apply_state(connection, state, plan["replayId"])
                 for trade in plan["trades"]:

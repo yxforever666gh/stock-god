@@ -124,17 +124,26 @@ async def test_non_trading_day_does_not_create_analysis_or_audit_rows(env, monke
 
 
 @pytest.mark.asyncio
-async def test_publication_uses_write_lock_time_and_first_report_wins(env):
+async def test_publication_uses_start_slot_and_keeps_late_completion_visible(env):
     async def late():
         env.clock.at = local("2026-09-24T09:55:01+08:00")
 
     env.ai.hook = late
     run = await env.service.analyze(local("2026-09-24T09:50:00+08:00"))
-    assert run["slot"] == "09:55" and run["scheduledSlot"] == "09:50" and not run["onTime"]
+    assert run["slot"] == "09:50" and run["scheduledSlot"] == "09:50" and not run["onTime"]
     env.ai.hook = None
     second = await env.service.analyze(local("2026-09-24T09:55:00+08:00"))
+    assert second["published"] and second["slot"] == "09:55"
+    assert len(env.service.repo.rows("recommendations")) == 14
+
+
+@pytest.mark.asyncio
+async def test_first_completed_run_wins_when_different_schedules_start_in_same_slot(env):
+    env.clock.at = local("2026-09-24T09:55:01+08:00")
+    first = await env.service.analyze(local("2026-09-24T09:50:00+08:00"))
+    second = await env.service.analyze(local("2026-09-24T09:55:00+08:00"))
+    assert first["published"] and first["slot"] == "09:55" and not first["onTime"]
     assert not second["published"] and "先落盘" in second["archiveReason"]
-    assert len(env.service.repo.rows("recommendations")) == 7
 
 
 @pytest.mark.asyncio

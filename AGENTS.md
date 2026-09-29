@@ -1,58 +1,59 @@
-# Stock God Working Rules
+# Stock God 工作规则
 
-These rules apply to the whole repository. Keep ordinary work local and bounded.
+本规则适用于整个仓库。日常工作保持本地、范围有界。
 
-## Product and ownership
+## 产品与代码归属
 
-- The active UI is 股票预测, settings and about. Market-data HTTP APIs and the minute/MCP service remain supported. Research 1, knowledge, stock/fund watchlists and market display pages are retired; do not recreate their entry points.
-- Python is the only current backend runtime. Do not restore Go sources, Go wrappers, Wails or a parallel implementation. Archived Go executables are permitted only as existing deployment rollback artifacts outside tracked source.
-- `stock_god.prediction` owns strategy, account, execution, returns, reports and task lifecycle. Market/AI providers are injected; prediction must not import concrete `market`, `app`, `cli`, `runtime`, `storage.migrations` or `storage.historical` code.
-- `stock_god.market` owns provider I/O and source validation, and must not import prediction or the composition root. `stock_god.storage` must not import current business packages. `config` and `jsonutil` are shared primitives and must not import features.
-- Historical migration definitions and algorithms remain frozen in `storage/historical`. Current prediction changes never alter their financial rules.
-- Persisted research2 table names, owner values and UUID namespaces are data contracts. Branding changes must not rewrite them.
-- Capture a deep settings/model snapshot at every task entry. Provider retries, fallback and evidence collection use that snapshot. Never temporarily replace global settings.
-- Saving settings affects later provider work. Disabling automation revokes old run publication/new-buy permission; re-enabling cannot revive it. Existing positions retain their exit handling.
+- 现役界面只有股票预测、设置和关于。行情 HTTP API 与分钟/MCP 服务继续提供；研究中心一、知识库、股票/基金自选及市场展示页已退役，不恢复其入口。
+- Python 是唯一现役后端运行时。不要恢复 Go 源码、Go 包装器、Wails 或并行实现；已有的归档 Go 可执行文件只能作为仓库外部署回滚制品保留。
+- `stock_god.prediction` 负责策略、账户、执行、收益、报告和任务生命周期。行情与 AI 提供者通过注入使用；预测包不得导入具体的 `market`、`app`、`cli`、`runtime`、`storage.migrations` 或 `storage.historical` 代码。
+- `stock_god.market` 负责提供者 I/O 和来源校验，不得导入预测包或组装根。`stock_god.storage` 不得导入当前业务包；共享基础模块 `config` 和 `jsonutil` 不得导入功能模块。
+- `storage/historical` 中的历史迁移定义和算法保持冻结。当前预测改动不得修改其中的历史财务规则。
+- 已持久化的 research2 表名、owner 值和 UUID 命名空间属于数据契约；品牌名称变化不得改写它们。
+- 每个任务入口都深拷贝设置和模型快照。提供者重试、回退及证据采集使用该快照，绝不临时替换全局设置。
+- 保存设置只影响后续提供者工作。关闭自动策略会撤销旧运行的发布和新买入权限；重新开启不能恢复已撤销的旧运行。已有持仓仍按原规则退出。
 
-## Keep changes small
+## 控制改动规模
 
-- Prefer deletion of obsolete code, simplifying existing code, merging real duplication, then extending an established boundary.
-- Optimize correctness, readability and total maintenance cost. Do not compress code merely to reduce physical lines.
-- Do not add abstractions, configuration, states or background jobs for hypothetical future use. Extract sharing after three real uses, or when a necessary dependency boundary already exists.
-- A routine task should stay in one domain. Split work exceeding ten source files or two domains unless the user explicitly requests a cross-domain change.
-- Remove replaced entry points, branches, options and obsolete tests in the same task. A necessary compatibility path must document its exact removal condition.
-- Avoid a repository-wide refactor while implementing a small feature. Use the architecture guide to identify the smallest responsible package.
-- Explain necessity and long-term cost when adding more than 200 production lines, changing more than ten source files, or adding a public interface, configuration, schema object or background job.
+- 优先删除过时代码、简化现有实现、合并真实重复，再扩展既有边界。
+- 以正确性、可读性和总维护成本为目标，不为了减少物理行数而压缩代码。
+- 不为假设的未来需求添加抽象、配置、状态或后台任务。共享逻辑出现三次真实使用后再提取，或在必要的依赖边界上提取。
+- 常规任务应限于一个领域。超过十个源码文件或两个领域的工作应拆分，除非用户明确要求跨领域改动。
+- 同一任务中移除被替换的入口、分支、选项和过时测试。必要的兼容路径须写明准确的移除条件。
+- 实现小功能时避免全仓重构；依据架构指南定位最小负责包。
+- 若增加超过 200 行生产代码、改动超过十个源码文件，或新增公共接口、配置、schema 对象、后台任务，说明其必要性和长期成本。
 
-## Verification
+## 验证
 
-- Read-only diagnosis does not run tests by default.
-- Routine implementation uses `scripts/verify.ps1 -Tier fast -TestPath <pytest target>` or `-FrontendTest <frontend test>`. Cross-boundary work uses one matching `-Tier domain -Domain prediction|market|storage|web|contracts`.
-- API changes update canonical `api/openapi.yaml`, regenerate TS with `python -m stock_god.contracts --write`, and check real FastAPI routes. Never edit generated TS independently as the final state.
-- Run affected frontend behavior tests when requests, pages or charts change. `tests/test_boundaries.py` guards package imports, retired surfaces, runtime language and version consistency.
-- A requested local version update uses the affected `-Tier domain` checks and frontend behavior tests. A requested new `X.0.0` runs `-Tier major`: all offline tests, contracts and frontend build, without routine lint or type checks. `-Tier release` is only for an explicit full-gate request.
-- Ordinary fixes do not automatically build, deploy, bump versions or add tags. A requested version update uses `scripts/update-local.ps1` after the final commit, with the affected domain and frontend test paths.
-- Do not repeat a passing check unless relevant code changed or an unresolved risk requires it. After two failures with the same cause, stop rerunning and diagnose.
-- Report unrelated/pre-existing failures separately. They do not expand the task silently.
-- Target three minutes for fast, eight minutes for a domain check, and 10–20 minutes for a routine fix. Major releases are separate work.
+- 只读诊断默认不运行测试。
+- 常规实现使用 `scripts/verify.ps1 -Tier fast -TestPath <pytest 目标>` 或 `-FrontendTest <前端测试>`。跨边界改动运行一个匹配的 `-Tier domain -Domain prediction|market|storage|web|contracts` 检查。
+- API 改动先更新规范源 `api/openapi.yaml`，用 `python -m stock_god.contracts --write` 重新生成 TS，并检查真实 FastAPI 路由；最终状态不得只修改生成的 TS。
+- 请求、页面或图表变化须运行受影响的前端行为测试。`tests/test_boundaries.py` 守护包导入、退役界面、运行时语言和版本一致性。
+- 用户要求本地版本升级时，运行受影响领域的 `-Tier domain` 检查和前端行为测试。要求新 `X.0.0` 时运行 `-Tier major`：全部离线测试、契约和前端构建，不例行运行 lint 或类型检查。只有明确要求全门禁时才运行 `-Tier release`。
+- 普通修复不自动构建、部署、升级版本或打 tag。用户要求版本升级时，在最终提交后使用 `scripts/update-local.ps1`，传入受影响领域与前端测试路径；完成验证后必须本机部署，并由正式计划任务重启、核对就绪。只有用户明确要求停在代码阶段时，才不执行部署重启。
+- 已通过的检查不因无关改动重复执行；同因连续失败两次后停止重跑并诊断。
+- 无关或既有失败单独报告，不悄悄扩大任务。
+- 快速检查目标三分钟，领域检查目标八分钟，常规修复目标 10–20 分钟；重大版本另行处理。
 
-## Data and test safety
+## 数据与测试安全
 
-- Repository tests use pytest `tmp_path` or disposable fixtures. They never migrate or write runtime/production databases.
-- Ordinary tests use the minimum current schema fixture; full historical migrations and SQLite integrity checks belong to migration/release-specific tests.
-- Live providers, external email and browser probes require an explicit opt-in. They are excluded from ordinary fast/domain/release gates. Test SMTP uses a local fixture.
-- Preserve full source evidence in durable storage and audit. Model prompts use compact snapshots and bounded scoring facts, not entire raw market documents.
-- Keep meaningful regression tests in the repository. One-off test harnesses, logs, downloaded artifacts, screenshots and database copies belong under `H:\Download` and are not committed.
-- Never delete existing user data or unrelated files while cleaning task output. Do not run Git GC or workspace cleanup as part of routine verification.
+- 仓库测试使用 pytest 的 `tmp_path` 或一次性 fixture，绝不迁移或写入运行时/生产数据库。
+- 常规测试采用最小的当前 schema fixture；完整历史迁移及 SQLite 完整性检查只用于迁移或发布专项测试。
+- 实时提供者、外部邮件和浏览器探测必须得到明确选择，不纳入常规 fast/domain/release 门禁。测试 SMTP 使用本地 fixture。
+- 完整来源证据持久保存并进入审计；模型提示只使用紧凑快照和有限评分事实，不塞入整篇原始行情文档。
+- 有意义的回归测试保留在仓库；一次性测试工具、日志、下载制品、截图和数据库副本放在 `H:\Download`，不提交。
+- 清理任务产物时不删除既有用户数据或无关文件。常规验证不运行 Git GC 或工作区清理。
 
-## Release and completion
+## 本地更新与完成
 
-- Ordinary commits remain local. For this project, a request to upgrade to a new `X.0.0` authorizes pushing only its verified commit and annotated tag through the configured SSH identity and proxy. Every other version gets a local annotated tag and no GitHub write. Never create a GitHub Release or Actions workflow.
-- Versions come from `src/stock_god/release_manifest.json` and must agree with project metadata and runtime identity. Do not bump versions for routine fixes.
-- The 6.0.0 language/data migration was a one-time historical acceptance, not a gate for later versions. Temporary test databases and logs stay outside Git.
-- Local updates use a versioned source/frontend snapshot and a reusable dependency-locked Python environment. Pure frontend/version/documentation updates skip database work; backend or dependency changes back up both databases, verify them, and migrate only when the schema changes. The existing scheduled task owns activation; verify process identity, `/readyz`, and the version before tagging. Preserve older artifacts and deployment receipts for rollback.
-- Failed checks or activation do not create a tag. Never move or overwrite a published tag. A failed major-version GitHub push leaves the successful local deployment/tag intact and must be reported.
-- Only one task writes a checkout. Parallel writers use separate Git worktrees and preserve unrelated local changes.
-- Completion requires the requested behavior, targeted checks, boundary contracts and `git diff --check`, with no unrelated changes. Stop after those conditions hold.
-- End with a short Complexity change note: production lines added/removed, source files touched, execution paths added/removed, public interfaces/configuration/schema added, and any old path still retained. Count physical lines; report prompts, tests, docs, generated metadata and data assets separately.
+- 普通提交保持本地。对于本项目，用户要求升级至新的 `X.0.0` 时，才通过已配置的 SSH 身份和代理推送经验证的提交及 annotated tag；其他版本只创建本地 annotated tag，不写入 GitHub。绝不创建 GitHub Release 或 Actions 工作流。
+- 版本以 `src/stock_god/release_manifest.json` 为准，并与项目元数据及运行时身份一致。普通修复不升级版本。
+- 6.0.0 语言和数据迁移的一次性验收不作为后续版本门禁；临时测试库及日志保留在 Git 仓库外。
+- 本地版本升级使用包含源码与前端的版本化快照，以及可复用、按依赖锁固定的 Python 环境。纯前端、版本或文档更新不操作数据库；后端或依赖变化先备份并验证双库，只有 schema 变化才执行迁移。由现有计划任务负责激活；打 tag 前必须核对进程身份、`/readyz` 与版本。保留旧制品及部署回执供回滚。
+- 用户要求的每次版本升级在检查通过后都要部署本机版本并重启服务，核对运行中的版本与就绪状态后才算完成。
+- 检查或激活失败时不创建 tag。不得移动或覆盖已发布 tag。重大版本 GitHub 推送失败时，保留已成功的本地部署和 tag，并明确报告。
+- 一个 checkout 同时只允许一个任务写入。并行写入使用独立 Git worktree，保留无关本地改动。
+- 完成条件包括请求的行为、定向检查、边界契约和 `git diff --check`，且无无关改动；满足后停止。
+- 结尾附简短“复杂度变化”：生产代码新增/删除的物理行数、涉及源码文件数、执行路径新增/移除、公共接口/配置/schema 新增情况，以及仍保留的旧路径。提示词、测试、文档、生成元数据和数据资产分别统计。
 
-Active guidance is limited to README, this file, and `docs/architecture.md`, `docs/operations.md`, `docs/data-apis.md`. Historical notes are references, not runtime instructions.
+现役指导文档仅限 README、本文件及 `docs/architecture.md`、`docs/operations.md`、`docs/data-apis.md`。历史笔记仅供参考，不作为运行时指令。

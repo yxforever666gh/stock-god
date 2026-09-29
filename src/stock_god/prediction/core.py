@@ -14,7 +14,7 @@ SLOTS = tuple(f"{minute // 60:02}:{minute % 60:02}" for minute in range(570, 690
 DEFAULT_SLOT = "09:50"
 TARGET_BUYS = 5
 ALLOCATION_POLICY = "remaining_cash_by_open_slots"
-STRATEGY_VERSION = "prediction-slots-v13"
+STRATEGY_VERSION = "prediction-slots-v14"
 
 
 class PredictionError(ValueError):

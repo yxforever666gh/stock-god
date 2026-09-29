@@ -276,6 +276,7 @@ class Repository:
             run = {
                 "run_id": str(uuid.uuid4()),
                 "scheduled_slot": slot,
+                "slot": slot_at(now),
                 "trading_date": day,
                 "attempt_no": (runs[0]["attempt_no"] + 1) if runs else 1,
                 "scheduled_for": stamp(scheduled),
@@ -304,19 +305,30 @@ class Repository:
             if stored["persisted_at"]:
                 return stored
             now = self.clock()  # Sample only after BEGIN IMMEDIATE owns the publication lock.
-            slot = slot_at(now)
+            started = local(stored["started_at"])
+            slot = slot_at(started)
+            completed_slot = slot_at(now)
             run.update(
                 persisted_at=stamp(now),
                 generated_at=stamp(now),
                 slot=slot,
-                on_time=slot == run["scheduled_slot"],
+                on_time=(
+                    slot == run["scheduled_slot"]
+                    and completed_slot == slot
+                    and started.date() == now.date()
+                ),
                 published=False,
                 chain_id="",
                 archive_reason="",
             )
             if run["trigger_source"] == "diagnostic":
                 run["archive_reason"] = "链路诊断，仅保留报告，不发布推荐或交易"
-            elif not slot or local(now).date().isoformat() != run["trading_date"]:
+            elif (
+                not slot
+                or not completed_slot
+                or started.date().isoformat() != run["trading_date"]
+                or local(now).date().isoformat() != run["trading_date"]
+            ):
                 run["archive_reason"] = "上午窗口外完成，仅保留报告"
             else:
                 chain = ensure_chain(connection, slot, now)

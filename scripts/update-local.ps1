@@ -1,7 +1,8 @@
 param(
     [ValidateSet('prediction','market','storage','web','contracts')]
     [string[]]$Domain,
-    [string[]]$FrontendTest
+    [string[]]$FrontendTest,
+    [string]$CorrectionPlan
 )
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -24,6 +25,16 @@ function Invoke-ReleaseJson([string[]]$Arguments) {
 Push-Location $root
 try {
     $plan = Invoke-ReleaseJson @('plan')
+    $correctionHash = $null
+    if ($plan.appVersion -eq '6.0.7') {
+        $expectedPlan = [IO.Path]::GetFullPath('H:\Download\stock-god-6.0.7\correction-plan.json')
+        if (-not $CorrectionPlan -or [IO.Path]::GetFullPath($CorrectionPlan) -ne $expectedPlan) {
+            throw '6.0.7 requires its explicit H:\Download correction plan.'
+        }
+        $correctionHash = (Get-FileHash -LiteralPath $CorrectionPlan -Algorithm SHA256).Hash.ToLowerInvariant()
+    } elseif ($CorrectionPlan) {
+        throw 'The correction-plan entry is limited to 6.0.7.'
+    }
     if (-not $plan.major -and -not $Domain.Count) {
         throw 'A small version requires -Domain with the affected domain.'
     }
@@ -58,12 +69,11 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Offline major-version verification failed.' }
     } else {
         for ($i = 0; $i -lt $Domain.Count; $i++) {
-            $arguments = @('-Tier','domain','-Domain',$Domain[$i])
+            $verifyParams = @{ Tier = 'domain'; Domain = $Domain[$i] }
             if ($i -eq 0 -and $FrontendTest.Count) {
-                $arguments += '-FrontendTest'
-                $arguments += $FrontendTest
+                $verifyParams.FrontendTest = $FrontendTest
             }
-            & $verify @arguments *>&1 | Tee-Object -FilePath $log -Append
+            & $verify @verifyParams *>&1 | Tee-Object -FilePath $log -Append
             if ($LASTEXITCODE -ne 0) { throw "Domain verification failed: $($Domain[$i])" }
         }
     }
@@ -93,7 +103,14 @@ try {
         if ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running') {
             Stop-ScheduledTask -TaskName $taskName
         }
-        $receipt = Invoke-ReleaseJson @('deploy','--candidate',$candidate,'--proof',$proof.proof)
+        $deployArgs = @('deploy','--candidate',$candidate,'--proof',$proof.proof)
+        if ($CorrectionPlan) {
+            if ((Get-FileHash -LiteralPath $CorrectionPlan -Algorithm SHA256).Hash.ToLowerInvariant() -ne $correctionHash) {
+                throw 'The correction plan changed after verification.'
+            }
+            $deployArgs += @('--correction-plan',$CorrectionPlan,'--correction-sha256',$correctionHash)
+        }
+        $receipt = Invoke-ReleaseJson $deployArgs
         $receiptPath = Join-Path $receipt.directory 'receipt.json'
         Start-ScheduledTask -TaskName $taskName
         $deadline = (Get-Date).AddMinutes(3)
