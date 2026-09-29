@@ -150,6 +150,17 @@ class Market:
     def cached_bars(self, *args, **kwargs):
         return self.bar_rows
 
+    def refresh_recommendation_chart(self, code, start, end):
+        rows = self.bars(code, start, end, period="1m", adjustment="none")
+        quote = self.quote(code)
+        dates = set()
+        day = start
+        while day.date() <= end.date():
+            if self.is_trading_day(day):
+                dates.add(day.date().isoformat())
+            day += timedelta(days=1)
+        return {"bars": rows, "quote": quote, "openedDates": dates, "errors": []}
+
 
 class AI:
     def __init__(self, market):

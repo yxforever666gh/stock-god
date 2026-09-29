@@ -54,9 +54,9 @@ def test_cold_start_ready_static_and_all_24_accounts_without_network(app_config)
         assert web.get("/livez").json() == {"ok": True}
         ready = web.get("/readyz")
         assert ready.status_code == 200
-        assert ready.json()["appVersion"] == "6.0.4"
+        assert ready.json()["appVersion"] == "6.0.5"
         assert all(ready.json()["readiness"].values())
-        assert web.get("/api/v1/system/info").json()["version"] == "6.0.4"
+        assert web.get("/api/v1/system/info").json()["version"] == "6.0.5"
         assert "Stock God" in web.get("/prediction").text
         assert web.get("/assets/missing.js").status_code == 404
         assert len(web.get("/api/v1/prediction/slots").json()) == 24
@@ -101,6 +101,15 @@ def test_websocket_body_limit_and_retired_routes(app_config):
             assert web.get(path).status_code == 404, path
         invalid = web.get("/api/v1/prediction/analysis-runs?limit=-1")
         assert invalid.status_code == 400 and "error" in invalid.json()
+
+
+def test_analysis_report_browse_route_pages_and_validates_day(app_config):
+    with client(app_config) as web:
+        response = web.get("/api/v1/prediction/analysis-runs/browse")
+        assert response.status_code == 200
+        assert response.json() == {"items": [], "total": 0, "page": 1, "pageSize": 100, "tradingDates": []}
+        assert web.get("/api/v1/prediction/analysis-runs/browse?day=2026-09-99").status_code == 400
+        assert web.get("/api/v1/prediction/analysis-runs/browse?page=0").status_code == 400
 
 
 def test_settings_cas_ai_test_and_retired_data_preserved(app_config):

@@ -290,16 +290,15 @@ def recommendation_chart(repository, market, identity, refresh):
     errors = []
     raw = []
     quote = {}
+    opened_dates = set()
+    weekday_fallback = False
     try:
-        loader = market.bars if refresh else market.cached_bars
-        raw = loader(
-            item["stock_code"],
-            start if refresh else start - timedelta(days=10),
-            end,
-            period="1m",
-            adjustment="none",
-        )
         if refresh:
+            snapshot = market.refresh_recommendation_chart(item["stock_code"], start, end)
+            raw = snapshot["bars"]
+            quote = snapshot["quote"]
+            opened_dates = snapshot["openedDates"]
+            errors.extend(snapshot["errors"])
             try:
                 raw = market.cached_bars(
                     item["stock_code"],
@@ -310,20 +309,20 @@ def recommendation_chart(repository, market, identity, refresh):
                 ) + raw
             except (OSError, ValueError, RuntimeError):
                 pass  # Prior close is optional; refreshed holding-period bars remain usable.
+        else:
+            raw = market.cached_bars(
+                item["stock_code"], start - timedelta(days=10), end, period="1m", adjustment="none"
+            )
     except (OSError, ValueError, RuntimeError) as error:
         errors.append({"provider": "minutes", "message": str(error)})
         if refresh:
+            weekday_fallback = True
             try:
                 raw = market.cached_bars(
                     item["stock_code"], start - timedelta(days=10), end, period="1m", adjustment="none"
                 )
             except (OSError, ValueError, RuntimeError) as cache_error:
                 errors.append({"provider": "minute-cache", "message": str(cache_error)})
-    if refresh:
-        try:
-            quote = market.quote(item["stock_code"])
-        except (OSError, ValueError, RuntimeError) as error:
-            errors.append({"provider": "quote", "message": str(error)})
     all_bars = sorted(
         {bar_time(bar): bar for bar in raw if valid_bar(bar)}.values(), key=bar_time
     )
@@ -353,7 +352,7 @@ def recommendation_chart(repository, market, identity, refresh):
     previous = 0.0
     while day.date() <= end.date():
         try:
-            opened = market.is_trading_day(day) if refresh else day.weekday() < 5
+            opened = day.weekday() < 5 if not refresh or weekday_fallback else day.date().isoformat() in opened_dates
         except (OSError, ValueError, RuntimeError) as error:
             opened = day.weekday() < 5
             errors.append({"provider": "calendar", "message": str(error)})

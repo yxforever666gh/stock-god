@@ -2,6 +2,7 @@
 
 export const API_PATHS = {
   analyzeWeightedSentiment: "/api/v1/market/sentiment/weighted",
+  browsePredictionAnalysisRuns: "/api/v1/prediction/analysis-runs/browse",
   connectEventsWebSocket: "/api/v1/events/ws",
   createPredictionReplay: "/api/v1/prediction/replays",
   deleteInstrumentDrawings: "/api/v1/instruments/{code}/drawings",
@@ -543,10 +544,18 @@ export type PredictionAnalysisRun = {
   sourceStatusJson: string
   standbyCount?: number
   startedAt: string
-  status: "running" | "success" | "no_recommendation" | "failed" | "skipped_non_trading_day" | "missed_window"
+  status: "running" | "success" | "no_recommendation" | "failed" | "missed_window"
   strategyVersion?: string
   tradingDate: string
   triggerSource?: string
+}
+
+export type PredictionAnalysisRunBrowse = {
+  items: Array<PredictionAnalysisRunSummary>
+  page: number
+  pageSize: 100
+  total: number
+  tradingDates: Array<string>
 }
 
 export type PredictionAnalysisRunSummary = {

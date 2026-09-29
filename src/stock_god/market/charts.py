@@ -5,6 +5,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ from .common import (
     instrument,
     now,
     number,
+    remaining_seconds,
     security_id,
     timestamp,
 )
@@ -153,6 +155,113 @@ class Charts(ProviderState):
             self._cached_minute_bars(instrument(code)["code"], timestamp(start), timestamp(end)), period
         )
 
+    def refresh_recommendation_chart(self, code, start, end):
+        """Bound chart-only provider work without changing execution price sources."""
+        code, start, end = instrument(code)["code"], timestamp(start), timestamp(end)
+        deadline = time.monotonic() + 13
+        errors = []
+        try:
+            cached = self._cached_minute_bars(code, start, end)
+        except MarketDataError as exc:
+            cached = []
+            errors.append({"provider": "minute-cache", "message": str(exc)})
+        by_time = {timestamp(bar["time"]): bar for bar in cached}
+        opened_dates = set()
+        day = end.replace(hour=12, minute=0, second=0, microsecond=0)
+        today = now().date()
+        while day.date() >= start.date():
+            date = day.date().isoformat()
+            day_rows = sorted(
+                (bar for at, bar in by_time.items() if at.date() == day.date()),
+                key=lambda bar: timestamp(bar["time"]),
+            )
+            if day.weekday() >= 5:
+                day -= timedelta(days=1)
+                continue
+            if not day_rows:
+                try:
+                    calendar_deadline = min(deadline, time.monotonic() + 1)
+                    if not self.is_trading_day(day, deadline=calendar_deadline):
+                        day -= timedelta(days=1)
+                        continue
+                except (MarketDataError, ValueError) as exc:
+                    errors.append({"provider": "calendar", "message": str(exc)})
+            opened_dates.add(date)
+            window_start = max(start, day.replace(hour=9, minute=30))
+            window_end = min(end, day.replace(hour=15, minute=0))
+            covered = self._chart_window_covered(day_rows, window_start, window_end, day.date() == today)
+            if window_start <= window_end and not covered:
+                sources = self._public_minute_sources(code, window_start, window_end, 5000)
+                if day.date() == today:
+                    sources.sort(key=lambda source: source[0] != "tencent")
+                if not sources:
+                    errors.append({"provider": "minutes", "message": date + ": no enabled minute provider"})
+                for name, load in sources:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    cap = {"tencent": 3, "private": 4, "sina": 2, "akshare": 2}[name]
+                    if name == "private":
+                        cap = min(cap, float(self.settings.get("privateMinuteTimeoutSec") or 60))
+                    try:
+                        fetched = [
+                            bar for bar in load(min(deadline, time.monotonic() + cap))
+                            if proves_unadjusted(bar.get("source"))
+                        ]
+                        if not fetched:
+                            raise MarketDataError("no verified minute bars in requested session")
+                        for bar in fetched:
+                            by_time[timestamp(bar["time"])] = bar
+                        try:
+                            self._save_minute_bars(code, fetched)
+                        except MarketDataError as exc:
+                            errors.append({"provider": "minute-cache", "message": str(exc)})
+                        day_rows = sorted(
+                            (bar for at, bar in by_time.items() if at.date() == day.date()),
+                            key=lambda bar: timestamp(bar["time"]),
+                        )
+                        if self._chart_window_covered(day_rows, window_start, window_end, day.date() == today):
+                            break
+                    except (MarketDataError, ValueError, KeyError, TypeError) as exc:
+                        errors.append({"provider": name, "message": date + ": " + str(exc)})
+            day -= timedelta(days=1)
+        quote = {}
+        if time.monotonic() < deadline:
+            try:
+                quote = self.quote(code, deadline=min(deadline, time.monotonic() + 2))
+            except (MarketDataError, ValueError) as exc:
+                errors.append({"provider": "quote", "message": str(exc)})
+        if time.monotonic() >= deadline:
+            errors.append({"provider": "chart", "message": "refresh time budget exhausted; verified cache retained"})
+        return {
+            "bars": [by_time[at] for at in sorted(by_time)],
+            "quote": quote,
+            "openedDates": opened_dates,
+            "errors": errors,
+        }
+
+    @staticmethod
+    def _chart_window_covered(rows, start, end, current_day):
+        target = (
+            end.replace(second=0, microsecond=0) - timedelta(minutes=1)
+            if current_day else end - timedelta(minutes=5)
+        )
+        if 690 <= target.hour * 60 + target.minute < 780:
+            target = target.replace(hour=11, minute=29)
+        if target < start:
+            return True
+        if (
+            not rows
+            or timestamp(rows[0]["time"]) > start + timedelta(minutes=6)
+            or timestamp(rows[-1]["time"]) < target
+        ):
+            return False
+        for left, right in zip(rows, rows[1:], strict=False):
+            a, b = timestamp(left["time"]), timestamp(right["time"])
+            if (a.hour < 12) == (b.hour < 12) and (b - a).total_seconds() > 300:
+                return False
+        return True
+
     def minute_line(self, code, name=""):
         code = instrument(code)["code"]
         endpoint = (
@@ -181,7 +290,7 @@ class Charts(ProviderState):
             )
         return {"priceData": rows, "date": payload["date"], "stockName": name, "stockCode": code}
 
-    def _tencent_bars(self, code, start, end, period, adjustment, limit):
+    def _tencent_bars(self, code, start, end, period, adjustment, limit, deadline=None):
         minute = period.endswith("m")
         if minute and (now() - end > timedelta(days=7) or end > now() + timedelta(minutes=2)):
             raise MarketDataError("Tencent minute source only covers recent windows")
@@ -193,7 +302,7 @@ class Charts(ProviderState):
         unit = "m1" if minute else "day"
         count = min(1200 if minute else 12000, limit * PERIODS[period])
         params = {"param": f"{code},{unit},,,{count}" + ("" if minute else f",{adjustment}")}
-        response = self.http.json(url, params, headers={"Referer": "https://gu.qq.com/"})
+        response = self.http.json(url, params, headers={"Referer": "https://gu.qq.com/"}, timeout=remaining_seconds(deadline))
         if response.get("code", 0) != 0:
             raise MarketDataError("Tencent bar source rejected request")
         payload = response.get("data", {}).get(code, {})
@@ -260,7 +369,7 @@ class Charts(ProviderState):
             )
         return valid_bars(result, start, end)
 
-    def _sina_bars(self, code, start, end, period, adjustment, limit):
+    def _sina_bars(self, code, start, end, period, adjustment, limit, deadline=None):
         if adjustment != "none":
             raise MarketDataError("Sina bars do not prove adjusted prices")
         rows = array(
@@ -272,6 +381,7 @@ class Charts(ProviderState):
                     "ma": "no",
                     "datalen": min(limit * PERIODS[period], 12000),
                 },
+                timeout=remaining_seconds(deadline),
             )
         )
         result = [
@@ -315,7 +425,7 @@ class Charts(ProviderState):
         ]
         return valid_bars(result, start, end)
 
-    def _akshare_bars(self, code, start, end):
+    def _akshare_bars(self, code, start, end, deadline=None):
         preference = self.settings.get("akshareMinuteSourceMode") or "auto"
         if preference not in {"auto", "sina", "em"}:
             raise ValueError("invalid AKShare minute source mode")
@@ -343,7 +453,7 @@ class Charts(ProviderState):
                     text=True,
                     encoding="utf-8",
                     env=environment,
-                    timeout=90,
+                    timeout=min(90, remaining_seconds(deadline) or 90),
                     check=False,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
@@ -389,18 +499,18 @@ class Charts(ProviderState):
         if self.settings.get("tencentMinuteEnabled", True) and (
             end.date() == today.date() or timedelta(0) <= today - end <= timedelta(days=7)
         ):
-            available["tencent"] = lambda: self._tencent_bars(code, start, end, "1m", "none", limit)
+            available["tencent"] = lambda deadline=None: self._tencent_bars(code, start, end, "1m", "none", limit, deadline)
         if self.settings.get("sinaMinuteEnabled", True) and end.date() == today.date():
-            available["sina"] = lambda: self._sina_bars(code, start, end, "1m", "none", limit)
+            available["sina"] = lambda deadline=None: self._sina_bars(code, start, end, "1m", "none", limit, deadline)
         if self.settings.get("akshareEnabled", True):
-            available["akshare"] = lambda: self._akshare_bars(code, start, end)
+            available["akshare"] = lambda deadline=None: self._akshare_bars(code, start, end, deadline)
         if (
             self.settings.get("privateMinuteEnabled")
             and self.settings.get("privateMinuteLevel", "1min") == "1min"
             and self.settings.get("privateMinuteBaseUrl")
             and self.settings.get("privateMinuteApiKey")
         ):
-            available["private"] = lambda: self._private_bars(code, start, end)
+            available["private"] = lambda deadline=None: self._private_bars(code, start, end, deadline)
         return [(name, available[name]) for name in order if name in available]
 
     def _prediction_eastmoney_bars(self, code, start, end):
@@ -488,10 +598,12 @@ class Charts(ProviderState):
         except sqlite3.Error as exc:
             raise MarketDataError("minute cache write failed") from exc
 
-    def _private_bars(self, code, start, end):
+    def _private_bars(self, code, start, end, deadline=None):
         base = str(self.settings.get("privateMinuteBaseUrl") or "https://mg.diemeng.chat/api").rstrip("/")
         result = []
+        private_timeout = float(self.settings.get("privateMinuteTimeoutSec") or 60)
         for page in range(1, 51):
+            remaining = remaining_seconds(deadline)
             payload = self.http.json(
                 base + "/stock/history",
                 method="POST",
@@ -504,6 +616,7 @@ class Charts(ProviderState):
                     "page": page,
                     "page_size": 5000,
                 },
+                timeout=min(private_timeout, remaining) if remaining is not None else private_timeout,
             )
             if payload.get("code", 0) not in (0, 200):
                 raise MarketDataError("private minute provider rejected request")

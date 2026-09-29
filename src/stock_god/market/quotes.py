@@ -11,7 +11,16 @@ from pathlib import Path
 
 import httpx
 
-from .common import CN, MarketDataError, ProviderState, database_rows, instrument, number, timestamp
+from .common import (
+    CN,
+    MarketDataError,
+    ProviderState,
+    database_rows,
+    instrument,
+    number,
+    remaining_seconds,
+    timestamp,
+)
 
 
 def parse_tencent(text: str) -> list[dict]:
@@ -128,7 +137,7 @@ def parse_sina(text: str) -> list[dict]:
 
 
 class Quotes(ProviderState):
-    def quotes(self, codes: list[str], *, require_all=True) -> list[dict]:
+    def quotes(self, codes: list[str], *, require_all=True, deadline=None) -> list[dict]:
         normalized = list(dict.fromkeys(instrument(code)["code"] for code in codes))
         found = {}
         failures = []
@@ -142,7 +151,7 @@ class Quotes(ProviderState):
             for offset in range(0, len(missing), 80):
                 chunk = missing[offset : offset + 80]
                 try:
-                    rows = parser(self.http.text(url, {parameter: ",".join(chunk)}, encoding="gb18030"))
+                    rows = parser(self.http.text(url, {parameter: ",".join(chunk)}, encoding="gb18030", timeout=remaining_seconds(deadline)))
                     for quote in rows:
                         if quote["code"] in chunk:
                             found[quote["code"]] = quote
@@ -153,9 +162,9 @@ class Quotes(ProviderState):
             raise MarketDataError(f"quotes unavailable for {', '.join(missing[:5])}; {'; '.join(failures)}")
         return [found[code] for code in normalized if code in found]
 
-    def quote(self, code: str) -> dict:
+    def quote(self, code: str, *, deadline=None) -> dict:
         normalized = instrument(code)["code"]
-        value = self.http.cached("quote:" + normalized, 2, lambda: self.quotes([normalized])[0])
+        value = self.http.cached("quote:" + normalized, 2, lambda: self.quotes([normalized], deadline=deadline)[0])
         rate = 0.3 if normalized.startswith("bj") else 0.2 if normalized.startswith(("sh68", "sz30")) else 0.1
         if "ST" in value["name"].upper():
             rate = 0.05
@@ -405,7 +414,7 @@ class Quotes(ProviderState):
                     output[key] = rows[0].get(column)
         return output
 
-    def is_trading_day(self, at: datetime) -> bool:
+    def is_trading_day(self, at: datetime, *, deadline=None) -> bool:
         day = timestamp(at)
         if day.weekday() >= 5:
             return False
@@ -427,6 +436,7 @@ class Quotes(ProviderState):
                     },
                     "fields": "exchange,cal_date,is_open",
                 },
+                timeout=remaining_seconds(deadline),
             )
             if result.get("code") != 0:
                 raise MarketDataError("trade calendar provider rejected request")

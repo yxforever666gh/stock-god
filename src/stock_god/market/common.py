@@ -29,6 +29,15 @@ class MarketDataError(RuntimeError):
         self.evidence = evidence
 
 
+def remaining_seconds(deadline):
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise MarketDataError("provider time budget exhausted")
+    return remaining
+
+
 @overload
 def number(value: Any, default: float) -> float: ...
 
@@ -172,11 +181,15 @@ class Transport:
         method: str = "GET",
         body: dict | None = None,
         form: dict | None = None,
+        timeout: float | None = None,
     ) -> str:
         values = {"User-Agent": USER_AGENT, "Referer": "https://finance.sina.com.cn/"}
         values.update(headers or {})
         try:
-            response = self.client.request(method, url, params=params, headers=values, json=body, data=form)
+            if timeout is None:
+                response = self.client.request(method, url, params=params, headers=values, json=body, data=form)
+            else:
+                response = self.client.request(method, url, params=params, headers=values, json=body, data=form, timeout=timeout)
             response.raise_for_status()
             return response.content.decode(encoding or response.encoding or "utf-8")
         except (httpx.HTTPError, UnicodeError) as exc:

@@ -7,6 +7,7 @@ import pytest
 
 from stock_god.prediction.core import (
     SLOTS,
+    PredictionError,
     continuous,
     fresh_quote,
     local,
@@ -40,6 +41,43 @@ def test_clock_exchange_fee_and_remaining_cash_rules():
     assert quantities == [100, 200, 200, 200, 200]
     assert size_buy("sh600001", 60, 10000, 5)[0] == 100
     assert size_buy("sz000001", 10, 2005, 5, "legacy_recorded", 20000)[0] == 200
+
+
+def test_analysis_report_browse_uses_recorded_days_and_pages_without_report_bodies(env):
+    dates = ["2026-09-29", "2026-09-28", "2026-09-25", "2026-09-24", "2026-09-23", "2026-09-22"]
+    with env.db.transaction() as connection:
+        for date in dates:
+            for attempt in range(1, 103 if date == dates[0] else 2):
+                identity = f"{date}-{attempt}"
+                at = date + "T09:50:00+08:00"
+                connection.execute(
+                    "INSERT INTO research2_analysis_runs "
+                    "(run_id,trading_date,attempt_no,scheduled_for,started_at,evidence_cutoff_at,"
+                    "status,published,recommendation_count,on_time,report_markdown) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (identity, date, attempt, at, at, at, "success", attempt == 1, 0, 1, "large report"),
+                )
+        connection.execute(
+            "INSERT INTO research2_analysis_runs "
+            "(run_id,trading_date,attempt_no,scheduled_for,started_at,evidence_cutoff_at,status) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                "closed-day", "2026-09-26", 1, "2026-09-26T09:50:00+08:00",
+                "2026-09-26T09:50:00+08:00", "2026-09-26T09:50:00+08:00",
+                "skipped_non_trading_day",
+            ),
+        )
+    recent = env.service.browse_runs()
+    assert recent["tradingDates"] == dates
+    assert recent["total"] == 106 and len(recent["items"]) == 100
+    assert "reportMarkdown" not in recent["items"][0]
+    assert len(env.service.browse_runs(2)["items"]) == 6
+    assert env.service.browse_runs(1, dates[0])["total"] == 102
+    assert env.service.browse_runs(1, "all")["total"] == 107
+    assert env.service.browse_runs(1, "recent5", False)["total"] == 5
+    assert len(env.service.list_runs(limit=500)) == 107
+    with pytest.raises(PredictionError, match="交易日"):
+        env.service.browse_runs(1, "2026-09-99")
 
 
 @pytest.mark.asyncio

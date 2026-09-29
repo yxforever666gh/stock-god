@@ -838,6 +838,32 @@ paths:
               schema:
                 type: array
                 items: {$ref: '#/components/schemas/PredictionAnalysisRunSummary'}
+  /api/v1/prediction/analysis-runs/browse:
+    get:
+      operationId: browsePredictionAnalysisRuns
+      description: Pages analysis summaries by a recorded trading day, the latest five recorded trading days, or all days.
+      parameters:
+      - name: page
+        in: query
+        required: false
+        schema: {type: integer, minimum: 1, default: 1}
+      - name: day
+        in: query
+        required: false
+        description: recent5, all, or a YYYY-MM-DD trading date
+        schema: {type: string, default: recent5}
+      - name: allReports
+        in: query
+        required: false
+        description: Include failed and archived attempts; false selects published reports only
+        schema: {type: boolean, default: true}
+      responses:
+        '200':
+          description: A page of analysis summaries and selectable recorded trading dates
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PredictionAnalysisRunBrowse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
   /api/v1/prediction/email/test:
     post:
       operationId: testPredictionEmail
@@ -2125,7 +2151,7 @@ components:
         generatedAt: {type: string, format: date-time, nullable: true}
         status:
           type: string
-          enum: [running, success, no_recommendation, failed, skipped_non_trading_day, missed_window]
+          enum: [running, success, no_recommendation, failed, missed_window]
         providerName: {type: string}
         modelName: {type: string}
         reportMarkdown: {type: string}
@@ -2186,6 +2212,19 @@ components:
         emailAttemptCount: {type: integer}
         emailLastError: {type: string}
         executionChain: {$ref: '#/components/schemas/PredictionExecutionChain'}
+    PredictionAnalysisRunBrowse:
+      type: object
+      required: [items, total, page, pageSize, tradingDates]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/PredictionAnalysisRunSummary'}
+        total: {type: integer, minimum: 0}
+        page: {type: integer, minimum: 1}
+        pageSize: {type: integer, enum: [100]}
+        tradingDates:
+          type: array
+          items: {type: string, format: date}
     PredictionExecutionChain:
       type: object
       required: [chainId, tradingDate, scheduledFor, status, targetSlots, filledSlots, startedAt, createdAt, updatedAt]

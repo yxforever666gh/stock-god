@@ -125,6 +125,36 @@ def test_public_chart_respects_disabled_sources_and_persisted_order(make_market,
     assert calls == ["private", "sina"]
 
 
+def test_recommendation_refresh_accepts_last_closed_minute_without_provider(make_market, monkeypatch):
+    at = datetime(2026, 9, 29, 11, 12, 3, tzinfo=CN)
+    monkeypatch.setattr("stock_god.market.charts.now", lambda: at)
+    service = make_market()
+    cached = [bar(at.replace(hour=9, minute=30, second=0) + timedelta(minutes=index)) for index in range(102)]
+    monkeypatch.setattr(service, "_cached_minute_bars", lambda *args: cached)
+    monkeypatch.setattr(service, "_public_minute_sources", lambda *args: pytest.fail("closed minutes are cached"))
+    monkeypatch.setattr(service, "quote", lambda *args, **kwargs: {"price": 10, "asOf": at.isoformat()})
+    result = service.refresh_recommendation_chart("sh600000", cached[0]["time"], at)
+    assert len(result["bars"]) == 102 and not result["errors"]
+    assert result["openedDates"] == {"2026-09-29"}
+
+
+def test_recommendation_refresh_tries_tencent_first_only_for_today(make_market, monkeypatch):
+    at = datetime(2026, 9, 29, 11, 12, 3, tzinfo=CN)
+    monkeypatch.setattr("stock_god.market.charts.now", lambda: at)
+    service = make_market(settings={"minuteProviderOrder": ["private", "tencent", "sina", "akshare"]})
+    cached = [bar(at.replace(hour=9, minute=30, second=0) + timedelta(minutes=index)) for index in range(100)]
+    calls = []
+    monkeypatch.setattr(service, "_cached_minute_bars", lambda *args: cached)
+    monkeypatch.setattr(service, "_save_minute_bars", lambda *args: None)
+    monkeypatch.setattr(service, "quote", lambda *args, **kwargs: {"price": 10, "asOf": at.isoformat()})
+    monkeypatch.setattr(service, "_public_minute_sources", lambda *args: [
+        ("private", lambda deadline: calls.append("private") or []),
+        ("tencent", lambda deadline: calls.append("tencent") or [bar(at.replace(hour=11, minute=10, second=0)), bar(at.replace(hour=11, minute=11, second=0))]),
+    ])
+    result = service.refresh_recommendation_chart("sh600000", cached[0]["time"], at)
+    assert calls == ["tencent"] and len(result["bars"]) == 102
+
+
 def test_disabled_public_and_private_sources_make_no_request(make_market, monkeypatch):
     at = datetime(2026, 9, 25, 10, tzinfo=CN)
     service = make_market(

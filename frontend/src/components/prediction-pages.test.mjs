@@ -113,7 +113,7 @@ test('prediction uses server ranks and execution states without selection roles 
 
 test('prediction keeps the five-minute account selector collapsed until clicked', async () => {
   const source = await readFile(new URL('predictionIndex.vue', import.meta.url), 'utf8')
-  assert.match(source, /<n-dropdown trigger="click"/)
+  assert.match(source, /<n-dropdown v-else trigger="click"/)
   assert.match(source, /slotOptions/)
   assert.match(source, /:render-label="renderSlotLabel"/)
   assert.match(source, /:node-props="slotNodeProps"/)
@@ -123,11 +123,31 @@ test('prediction keeps the five-minute account selector collapsed until clicked'
   assert.doesNotMatch(source, /predictionSlotReportLabel|reportTagType|持仓：/)
   assert.doesNotMatch(source, /已完成|尚未完成/)
   assert.match(source, /选择五分钟区间/)
+  assert.match(source, /选择交易日/)
+  assert.match(source, /最近5个交易日/)
+  assert.match(source, /全部交易日/)
   assert.doesNotMatch(source, /<n-tab v-for="slot in PREDICTION_SLOTS"/)
 })
 
+test('prediction report selector defaults to five recorded days and accepts a single day', async () => {
+  globalThis.__researchPageFixtures = {ListPredictionSlots: async () => []}
+  const app = renderer.createApp(await pageComponent('predictionIndex.vue'))
+  const vm = app.mount({})
+  try {
+    const state = vm.$.setupState
+    assert.equal(state.reportDay, 'recent5')
+    state.updateReportDates(['2026-09-29', '2026-09-28'])
+    state.updateReportDay('2026-09-29')
+    assert.equal(state.reportDayLabel, '2026-09-29')
+    assert.deepEqual(state.reportDayOptions.map(option => option.key), ['recent5', 'all', '2026-09-29', '2026-09-28'])
+  } finally {
+    app.unmount()
+    delete globalThis.__researchPageFixtures
+  }
+})
+
 test('prediction report explains the one-report daily limit and does not offer another analysis', async () => {
-  globalThis.__researchPageFixtures = {ListPredictionRuns: async () => [], GetPredictionRun: async () => ({})}
+  globalThis.__researchPageFixtures = {BrowsePredictionRuns: async () => ({items: [], total: 0, tradingDates: []}), GetPredictionRun: async () => ({})}
   const app = renderer.createApp(await pageComponent('predictionReport.vue'))
   const vm = app.mount({})
   try {
@@ -144,6 +164,9 @@ test('prediction report explains the one-report daily limit and does not offer a
     assert.match(source, /成功按落盘时间归区间/)
     assert.match(source, /卖出由各账户的定时任务独立执行/)
     assert.doesNotMatch(source, /主选|候选|补位|主备|主\/备|09:55/)
+    assert.match(source, /}, 5000,/)
+    assert.match(source, /<n-pagination/)
+    assert.doesNotMatch(source, /PredictionHistoryFooter|加载更多/)
   } finally {
     app.unmount()
     delete globalThis.__researchPageFixtures
@@ -181,7 +204,7 @@ test('prediction yield lists only bought rows and exposes one mutually exclusive
   }
 })
 
-for (const filename of ['predictionRecommendations.vue', 'predictionYield.vue', 'predictionReport.vue']) {
+for (const filename of ['predictionRecommendations.vue', 'predictionYield.vue']) {
   test(`${filename}: all 201 historical rows remain reachable and details reject late responses`, async () => {
     const rows = Array.from({length: 201}, (_, index) => ({recommendationId: `r${index}`, runId: `r${index}`, activatedAt: '2026-09-07', status: 'closed'}))
     const details = new Map()
@@ -203,7 +226,7 @@ for (const filename of ['predictionRecommendations.vue', 'predictionYield.vue', 
       details.get('a')({id: 'a'}); await a
       assert.equal(state.detail.id, 'b')
       await state.history.refresh()
-      assert.equal(state.rows.length, filename.includes('Report') ? 100 : 200)
+      assert.equal(state.rows.length, 200)
     } finally {
       app.unmount()
       delete globalThis.__researchPageFixtures
@@ -214,7 +237,7 @@ for (const filename of ['predictionRecommendations.vue', 'predictionYield.vue', 
 test('prediction refreshes a pending detail when its list reaches a terminal state first', async () => {
   let finishOldDetail, detailReads = 0, listStatus = 'running'
   globalThis.__researchPageFixtures = {
-    ListPredictionRuns: async () => [{runId: 'r', status: listStatus}],
+    BrowsePredictionRuns: async () => ({items: [{runId: 'r', status: listStatus}], total: 1, tradingDates: ['2026-09-29']}),
     GetPredictionRun: async () => {
       detailReads++
       if (detailReads === 1) return await new Promise(resolve => { finishOldDetail = resolve })
@@ -235,6 +258,32 @@ test('prediction refreshes a pending detail when its list reaches a terminal sta
     assert.equal(state.detail.status, 'success')
     assert.equal(state.detailLoading, false)
     assert.equal(detailReads, 2)
+  } finally {
+    app.unmount()
+    delete globalThis.__researchPageFixtures
+  }
+})
+
+test('report pages 100 rows and keeps a selected trading day on later pages', async () => {
+  const calls = []
+  const runs = Array.from({length: 101}, (_, index) => ({runId: `run-${index}`, status: 'success'}))
+  globalThis.__researchPageFixtures = {
+    BrowsePredictionRuns: async (page, day) => {
+      calls.push([page, day])
+      return {items: runs.slice((page - 1) * 100, page * 100), total: 101, page, pageSize: 100, tradingDates: ['2026-09-29']}
+    },
+    GetPredictionRun: async () => ({}),
+  }
+  const app = renderer.createApp(await pageComponent('predictionReport.vue'), {reportDay: '2026-09-29'})
+  const vm = app.mount({})
+  try {
+    await flush()
+    const state = vm.$.setupState
+    assert.equal(state.rows.length, 100)
+    assert.equal(state.pageCount, 2)
+    await state.loadPage(2)
+    assert.equal(state.rows.length, 1)
+    assert.deepEqual(calls, [[1, '2026-09-29'], [2, '2026-09-29']])
   } finally {
     app.unmount()
     delete globalThis.__researchPageFixtures

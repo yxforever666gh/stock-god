@@ -1,8 +1,9 @@
 import {requestJSON, withPath, withQuery} from './http-client'
 import {API_PATHS} from './api-types.generated'
-import type {RecommendationChart, PredictionAccountOverview, PredictionAnalysisRun, PredictionAnalysisRunSummary, PredictionPerformance, PredictionPortfolioPerformance, PredictionRecommendation, PredictionRecommendationDetail} from './api-types.generated'
+import type {RecommendationChart, PredictionAccountOverview, PredictionAnalysisRun, PredictionAnalysisRunBrowse, PredictionAnalysisRunSummary, PredictionPerformance, PredictionPortfolioPerformance, PredictionRecommendation, PredictionRecommendationDetail} from './api-types.generated'
 
 export const ListPredictionRuns = (limit = 100, offset = 0, slot = ""): Promise<PredictionAnalysisRunSummary[]> => requestJSON(withQuery(API_PATHS.listPredictionAnalysisRuns, {limit, offset, slot}))
+export const BrowsePredictionRuns = (page = 1, day = 'recent5', allReports = true): Promise<PredictionAnalysisRunBrowse> => requestJSON(withQuery(API_PATHS.browsePredictionAnalysisRuns, {page, day, allReports}))
 export const GetPredictionRun = (id: string): Promise<PredictionAnalysisRun> => requestJSON(withPath(API_PATHS.getPredictionAnalysisRun, {id}))
 export const ListPredictionRecommendations = (limit = 100, offset = 0, slot = "09:50"): Promise<PredictionRecommendation[]> => requestJSON(withQuery(API_PATHS.listPredictionRecommendations, {limit, offset, slot}))
 export const ListPredictionPerformanceRecommendations = (limit = 100, offset = 0, slots: string[] = [], from = "", to = ""): Promise<PredictionRecommendation[]> => requestJSON(withQuery(API_PATHS.listPredictionRecommendations, {limit, offset, slots: slots.join(','), from, to, boughtOnly: true}))

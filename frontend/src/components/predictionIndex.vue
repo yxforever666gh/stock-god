@@ -15,7 +15,7 @@ const router = useRouter()
 const selectedSlot = ref(validPredictionSlot(route.query.slot) ? String(route.query.slot) : '09:50')
 const slotStates = ref([])
 async function refreshSlots() { try { slotStates.value = await ListPredictionSlots() || [] } catch { slotStates.value = [] } }
-const slotPolling = usePolling(refreshSlots, 15000)
+const slotPolling = usePolling(refreshSlots, 15000, {shouldRun: () => nowTab.value !== 'AI分析报告'})
 const selectedSlotInfo = computed(() => PREDICTION_SLOTS.find(slot => slot.value === selectedSlot.value) || PREDICTION_SLOTS[0])
 const selectedSlotState = computed(() => slotStates.value.find(item => item.slot === selectedSlot.value))
 const slotOptions = computed(() => PREDICTION_SLOTS.map(slot => {
@@ -53,12 +53,31 @@ function updateSlot(slot) {
 watch(() => route.query.slot, slot => updateSlot(validPredictionSlot(slot) ? String(slot) : '09:50'))
 const nowTab = ref(tabs.some(tab => tab.name === route.query.name) ? String(route.query.name) : tabs[0].name)
 const visited = ref([nowTab.value])
+const validReportDay = value => ['recent5', 'all'].includes(value) || /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))
+const reportDay = ref(validReportDay(route.query.reportDay) ? String(route.query.reportDay) : 'recent5')
+const reportDates = ref([])
+const reportDayOptions = computed(() => [
+  {key: 'recent5', label: '最近5个交易日'},
+  {key: 'all', label: '全部交易日'},
+  ...reportDates.value.map(day => ({key: day, label: day})),
+])
+const reportDayLabel = computed(() => reportDayOptions.value.find(item => item.key === reportDay.value)?.label || reportDay.value)
+function updateReportDates(dates) {
+  reportDates.value = [...new Set((dates || []).filter(day => /^\d{4}-\d{2}-\d{2}$/.test(day)))].sort().reverse()
+}
+function updateReportDay(day) {
+  if (!validReportDay(day)) return
+  reportDay.value = day
+  if (route.query.reportDay !== day) router.replace({name: 'prediction', query: {...route.query, reportDay: day}})
+}
+watch(() => route.query.reportDay, day => updateReportDay(validReportDay(day) ? String(day) : 'recent5'))
 
 function updateTab(name) {
   if (!tabs.some(tab => tab.name === name)) return
   nowTab.value = name
   if (!visited.value.includes(name)) visited.value.push(name)
   if (route.query.name !== name) router.replace({name: 'prediction', query: {...route.query, name}})
+  if (name !== 'AI分析报告') void refreshSlots()
 }
 watch(() => route.query.name, name => updateTab(String(name || tabs[0].name)))
 onMounted(() => slotPolling.start({immediate: true}))
@@ -67,20 +86,30 @@ onMounted(() => slotPolling.start({immediate: true}))
 <template>
   <n-card>
     <div class="prediction-slot-toolbar">
-      <n-dropdown trigger="click" :options="slotOptions" :render-label="renderSlotLabel" :node-props="slotNodeProps" @select="updateSlot">
+      <n-dropdown v-if="nowTab === 'AI分析报告'" trigger="click" :options="reportDayOptions" @select="updateReportDay">
+        <n-button secondary size="small" class="prediction-slot-current-button" aria-label="选择交易日">
+          <span class="prediction-slot-current-prefix">当前选择</span>
+          <strong>{{ reportDayLabel }}</strong>
+          <span class="prediction-slot-chevron" aria-hidden="true">⌄</span>
+        </n-button>
+      </n-dropdown>
+      <n-dropdown v-else trigger="click" :options="slotOptions" :render-label="renderSlotLabel" :node-props="slotNodeProps" @select="updateSlot">
         <n-button secondary size="small" class="prediction-slot-current-button" aria-label="选择五分钟区间">
           <span class="prediction-slot-current-prefix">当前选择</span>
           <strong>{{ selectedSlotInfo.label }}</strong>
           <span class="prediction-slot-chevron" aria-hidden="true">⌄</span>
         </n-button>
       </n-dropdown>
-      <div class="prediction-slot-status" aria-live="polite">
+      <div v-if="nowTab !== 'AI分析报告'" class="prediction-slot-status" aria-live="polite">
         <n-tag size="small" :type="buyTagType(selectedSlotState)" bordered="false">{{ predictionSlotBuyLabel(selectedSlotState) }}</n-tag>
       </div>
     </div>
     <n-tabs type="line" animated :value="nowTab" @update-value="updateTab">
       <n-tab-pane v-for="tab in tabs" :key="tab.name" :name="tab.name" :tab="tab.name">
-        <component v-if="visited.includes(tab.name)" :is="tab.component" :key="`${tab.name}:${selectedSlot}`" :slot="selectedSlot"/>
+        <component v-if="visited.includes(tab.name)" :is="tab.component"
+          :key="tab.name === 'AI分析报告' ? tab.name : `${tab.name}:${selectedSlot}`"
+          v-bind="tab.name === 'AI分析报告' ? {reportDay, active: nowTab === tab.name} : {slot: selectedSlot}"
+          @trading-dates="updateReportDates"/>
       </n-tab-pane>
     </n-tabs>
   </n-card>

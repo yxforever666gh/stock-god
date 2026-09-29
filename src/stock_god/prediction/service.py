@@ -612,6 +612,9 @@ class PredictionService:
     def list_runs(self, *args, **kwargs):
         return self.views.runs(*args, **kwargs)
 
+    def browse_runs(self, *args, **kwargs):
+        return self.views.browse_runs(*args, **kwargs)
+
     def get_run(self, identity):
         return self.views.run(identity)
 

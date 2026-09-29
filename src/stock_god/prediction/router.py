@@ -40,6 +40,14 @@ def create_router(service):
     def runs(limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0), slot: str = ""):
         return call(service.list_runs, limit, offset, slot)
 
+    @router.get("/analysis-runs/browse", operation_id="browsePredictionAnalysisRuns")
+    def browse_runs(
+        page: int = Query(1, ge=1),
+        day: str = "recent5",
+        all_reports: bool = Query(True, alias="allReports"),
+    ):
+        return call(service.browse_runs, page, day, all_reports)
+
     @router.get("/analysis-runs/{id}", operation_id="getPredictionAnalysisRun")
     def run(id: str):
         return call(service.get_run, id)

@@ -1,20 +1,25 @@
 <script setup>
-import {h, onMounted, ref, watch} from 'vue'
+import {computed, h, onBeforeUnmount, onMounted, ref, watch} from 'vue'
 import {NButton, NTag} from 'naive-ui'
 import AppMarkdownPreview from './AppMarkdownPreview.vue'
 import PredictionAuditPanel from './prediction-audit/PredictionAuditPanel.vue'
-import PredictionHistoryFooter from './PredictionHistoryFooter.vue'
-import {usePredictionDetail, usePredictionList} from '../composables/usePredictionRequests.js'
+import {usePredictionDetail} from '../composables/usePredictionRequests.js'
 import {usePolling} from '../composables/usePolling.js'
-import {GetPredictionRun, ListPredictionRuns} from '../services/prediction-api'
+import {BrowsePredictionRuns, GetPredictionRun} from '../services/prediction-api'
 
-const props = defineProps({slot: {type: String, default: '09:50'}})
+const props = defineProps({reportDay: {type: String, default: 'recent5'}, active: {type: Boolean, default: true}})
+const emit = defineEmits(['trading-dates'])
 const allReports = ref(true)
-const history = usePredictionList(async (limit, offset) => await ListPredictionRuns(limit, offset, allReports.value ? '' : props.slot) || [], {key: 'runId', pageSize: 100})
-const {rows, loading, error: listError, hasMore} = history
+const rows = ref([])
+const total = ref(0)
+const page = ref(1)
+const pageCount = computed(() => Math.max(1, Math.ceil(total.value / 100)))
+const loading = ref(false)
+const listError = ref('')
 const detailRequest = usePredictionDetail(GetPredictionRun)
 const {detail, visible, loading: detailLoading, error: detailError} = detailRequest
-const labels = {running: '分析中', success: '已推荐', no_recommendation: '空仓', failed: '失败', skipped_non_trading_day: '非交易日', missed_window: '错过交易窗口'}
+let requestVersion = 0
+const labels = {running: '分析中', success: '已推荐', no_recommendation: '空仓', failed: '失败', missed_window: '错过交易窗口'}
 const emailLabels = {pending: '待发送', sending: '发送中', retry_wait: '等待重试', sent: '已发送', failed: '发送失败', cancelled: '已取消'}
 const dateTime = value => value ? String(value).slice(0, 19).replace('T', ' ') : '--'
 const coverage = value => value !== null && value !== undefined && Number.isFinite(Number(value)) ? `${Number(value).toFixed(1)}%` : '--'
@@ -44,13 +49,33 @@ const columns = [
   {title: '说明', key: 'failureReason', minWidth: 220, ellipsis: {tooltip: true}, render: row => shortFailureReason(row.failureReason)},
   {title: '操作', key: 'action', width: 90, render: row => h(NButton, {size: 'small', tertiary: true, type: 'primary', onClick: () => show(row)}, {default: () => '查看'})},
 ]
-async function refresh() { await history.refresh(); if (visible.value) await detailRequest.refresh() }
+async function loadPage(nextPage = page.value, refreshDetail = false) {
+  const version = ++requestVersion
+  loading.value = true
+  listError.value = ''
+  try {
+    const result = await BrowsePredictionRuns(nextPage, props.reportDay, allReports.value)
+    if (version !== requestVersion) return
+    rows.value = result.items || []
+    total.value = result.total || 0
+    page.value = nextPage
+    emit('trading-dates', result.tradingDates || [])
+    if (visible.value && (refreshDetail || !detail.value || detail.value.status === 'running')) await detailRequest.refresh()
+  } catch (reason) {
+    if (version === requestVersion) listError.value = reason?.message || String(reason)
+  } finally {
+    if (version === requestVersion) loading.value = false
+  }
+}
+const refresh = () => loadPage(page.value, true)
 const polling = usePolling(async () => {
-  await history.refreshHead()
-  if (visible.value && (!detail.value || detail.value.status === 'running')) await detailRequest.refresh()
-}, 2000, {shouldRun: () => rows.value.some(row => row.status === 'running')})
-watch(allReports, () => { void refresh() })
-onMounted(() => { void refresh(); polling.start({immediate: false}) })
+  await loadPage(1)
+}, 5000, {shouldRun: () => props.active && page.value === 1 && rows.value.some(row => row.status === 'running')})
+watch(allReports, () => { void loadPage(1) })
+watch(() => props.reportDay, () => { void loadPage(1) })
+watch(() => props.active, active => { if (active) void loadPage(page.value) })
+onMounted(() => { void loadPage(1); polling.start({immediate: false}) })
+onBeforeUnmount(() => { requestVersion++ })
 </script>
 
 <template>
@@ -58,8 +83,12 @@ onMounted(() => { void refresh(); polling.start({immediate: false}) })
     <n-alert type="info" :bordered="false">09:30至11:25每五分钟独立启动。成功按落盘时间归区间，先到先得；后到及11:30后完成的报告仅归档。买入跟随有效推荐，卖出由各账户的定时任务独立执行。</n-alert>
     <n-checkbox v-model:checked="allReports">全部报告（包含失败、后到和午休后报告）</n-checkbox>
     <n-flex justify="end"><n-button :loading="loading" @click="refresh">刷新</n-button></n-flex>
+    <n-alert v-if="listError" type="error" :bordered="false">{{ listError }}</n-alert>
     <n-data-table :columns="columns" :data="rows" :loading="loading" :scroll-x="2210" :row-key="row => row.runId"/>
-    <PredictionHistoryFooter :count="rows.length" :has-more="hasMore" :loading="loading" :error="listError" @load-more="history.loadMore"/>
+    <n-flex justify="space-between" align="center">
+      <n-text depth="3">共 {{ total }} 条；每页 100 条</n-text>
+      <n-pagination :page="page" :page-count="pageCount" :page-size="100" :disabled="loading" @update:page="next => loadPage(next)"/>
+    </n-flex>
   </n-space>
   <n-modal v-model:show="visible">
     <n-card title="隔夜强势分析报告" closable style="width:min(1380px,96vw);max-height:94vh" @close="visible=false">

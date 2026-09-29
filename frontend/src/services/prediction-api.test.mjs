@@ -32,6 +32,11 @@ test('prediction data, chart, settings and replay calls use the new routes and p
   assert.equal(query.get('boughtOnly'), 'true')
   assert.equal(query.get('from'), '2026-09-01')
   assert.equal(query.get('to'), '2026-09-25')
+  const reportPage = await prediction.BrowsePredictionRuns(2, '2026-09-29', false)
+  const reportQuery = new URL(reportPage.path, 'http://localhost').searchParams
+  assert.equal(reportQuery.get('page'), '2')
+  assert.equal(reportQuery.get('day'), '2026-09-29')
+  assert.equal(reportQuery.get('allReports'), 'false')
   assert.deepEqual(await prediction.RefreshPredictionRecommendationChart('id/a'), {path: '/api/v1/prediction/recommendations/id%2Fa/chart/refresh', method: 'POST'})
 
   const settings = await service('./settings-api.js')

@@ -23,6 +23,12 @@ DAILY_SELECTION = """WITH selection_days AS (
 )
 """
 
+RUN_SUMMARY_FIELDS = """scheduled_slot slot published archive_reason persisted_at run_id trading_date
+attempt_no chain_id parent_run_id trigger_source requested_slots primary_count standby_count
+scheduled_for started_at evidence_window_start_at evidence_cutoff_at evidence_coverage_pct
+degraded generated_at status provider_name model_name strategy_version evidence_profile_version
+evidence_set_id recommendation_count on_time failure_reason""".split()
+
 
 def portfolio_query(slots=None, from_date="", to_date=""):
     selected = sorted(set(slots or SLOTS))
@@ -68,7 +74,8 @@ class Views:
             valid_slot(slot)
         rows = self.repo.rows(
             "analysis_runs",
-            "slot=? OR (coalesce(slot,'')='' AND scheduled_slot=?)" if slot else "1",
+            "status<>'skipped_non_trading_day' AND "
+            "(slot=? OR (coalesce(slot,'')='' AND scheduled_slot=?))" if slot else "status<>'skipped_non_trading_day'",
             (slot, slot) if slot else (),
             "julianday(scheduled_for) DESC,id DESC",
         )
@@ -79,6 +86,54 @@ class Views:
                 value.pop(field, None)
             result.append(value)
         return result
+
+    def browse_runs(self, page=1, day="recent5", all_reports=True):
+        if day not in {"recent5", "all"}:
+            try:
+                if date.fromisoformat(day).isoformat() != day:
+                    raise ValueError()
+            except ValueError:
+                raise PredictionError("交易日必须为 YYYY-MM-DD") from None
+        with self.repo.db.connection() as connection:
+            dates = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT DISTINCT trading_date FROM research2_analysis_runs "
+                    "WHERE trading_date<>'' AND status<>'skipped_non_trading_day' ORDER BY trading_date DESC"
+                )
+            ]
+            where, params = ["r.status<>'skipped_non_trading_day'"], []
+            if day == "recent5":
+                recent = dates[:5]
+                where.append("r.trading_date IN (" + ",".join("?" for _ in recent) + ")" if recent else "0")
+                params.extend(recent)
+            elif day != "all":
+                where.append("r.trading_date=?")
+                params.append(day)
+            if not all_reports:
+                where.append("r.published=1")
+            condition = " AND ".join(where) if where else "1"
+            total = connection.execute(
+                f"SELECT count(*) FROM research2_analysis_runs r WHERE {condition}", params
+            ).fetchone()[0]
+            fields = ",".join("r." + field for field in RUN_SUMMARY_FIELDS)
+            rows = many(
+                connection,
+                f"SELECT {fields},e.status email_delivery_status,e.sent_at email_sent_at,"
+                "e.attempt_count email_attempt_count,e.last_error email_last_error "
+                "FROM research2_analysis_runs r LEFT JOIN research2_email_deliveries e "
+                f"ON e.analysis_run_id=r.run_id WHERE {condition} "
+                "ORDER BY julianday(r.scheduled_for) DESC,r.id DESC LIMIT 100 OFFSET ?",
+                (*params, (page - 1) * 100),
+            )
+        items = []
+        for row in rows:
+            value = dto(row)
+            if row["email_delivery_status"] is None:
+                for field in ("emailDeliveryStatus", "emailSentAt", "emailAttemptCount", "emailLastError"):
+                    value.pop(field, None)
+            items.append(value)
+        return {"items": items, "total": total, "page": page, "pageSize": 100, "tradingDates": dates}
 
     def recommendations(
         self,
