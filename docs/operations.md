@@ -1,4 +1,4 @@
-# 本地运行、验证与发布
+# 本地运行、验证与更新
 
 ## 环境与启动
 
@@ -63,38 +63,38 @@ pwsh -NoProfile -File scripts/ensure-running.ps1 -Mode Install
 pwsh -File scripts/verify.ps1 -Tier fast -TestPath tests/prediction/test_prediction.py
 pwsh -File scripts/verify.ps1 -Tier domain -Domain prediction
 pwsh -File scripts/verify.ps1 -Tier domain -Domain contracts
+pwsh -File scripts/verify.ps1 -Tier major
 pwsh -File scripts/verify.ps1 -Tier release
 ```
 
-领域可选 `prediction`、`market`、`storage`、`web`、`contracts`；前端定向检查使用 `-FrontendTest`，路径相对于 `frontend`。`release` 包括全量离线测试、lint、类型、契约与前端构建，只用于明确的发布或全门禁请求。通过的检查不因无关改动重复执行。
+领域可选 `prediction`、`market`、`storage`、`web`、`contracts`；前端定向检查使用 `-FrontendTest`，路径相对于 `frontend`。`major` 跑全部离线 pytest、契约、前端行为测试和构建；`release` 额外包含 lint 和类型检查，只用于明确要求全门禁时。通过的检查不因无关改动重复执行。
 
 接口变更后运行 `uv run --frozen python -m stock_god.contracts --write` 更新生成 TS，再运行无 `--write` 的检查。边界测试要求已退役路径不再出现、无 Go 运行时源码、包依赖方向和版本一致。
 
-## 6.0.0 发布验收
+## 本地版本更新
 
-最终候选必须完成本地 release 门禁、独立冷启动链路、重启/失败恢复链路，以及用户要求的一次真实行情和模型预测。真实预测使用 `H:\Download` 中的临时数据库副本；测试邮件发本地 SMTP fixture。原始输出、临时 test 和数据库副本不入库，保留脱敏验证回执及其哈希。
-
-验证回执绑定 commit、依赖锁和制品身份。构建候选后使用 `scripts/release.py inspect --candidate <目录>` 检查；部署使用：
+代码和版本号提交后，从干净的 checkout 执行一次更新命令：
 
 ```powershell
-uv run --frozen python scripts/release.py build --uv <uv.exe完整路径>
-uv run --frozen python scripts/release.py inspect --candidate <候选目录>
-uv run --frozen python scripts/release.py deploy --candidate <候选目录> --proof <验收回执JSON>
+pwsh -File scripts/update-local.ps1 -Domain prediction
+pwsh -File scripts/update-local.ps1 -Domain web -FrontendTest src/components/prediction-pages.test.mjs
 ```
 
-`proof` 必须来自已执行的验证，不能手写“通过”代替测试。当前四个阶段为 `local-release-gate`、`offline-cold`、`offline-restart`、`live-prediction`。候选内容变化后，旧回执失效。
+`-Domain` 可传多个受影响领域；改了前端必须指定相应 `-FrontendTest`。新 `X.0.0` 自动改用 `major` 验证，无需传领域。命令检查版本一致和已有 tag，运行测试，保存日志到 `H:\Download\stock-god-update`，只构建一次前端，并自动生成绑定 commit、锁文件及快照哈希的验证记录。失败时不打 tag、不部署。
 
-这四项同时强制适用于 6.0.0 的语言和数据迁移。后续普通版本默认只要求本地 release 门禁；额外完整演练与真实模型调用按用户明确要求执行，日常修复仍使用定向验证。
+快照位于 `runtime/releases/<版本>/<commit>`，包含源码、API 和前端文件；相同依赖锁和解释器复用 `runtime/toolchain/envs` 内的 Python 环境。前端未改动时复用上一版产物。旧格式制品继续可用于现有部署回执的回退。
 
-用户明确授权后才创建 annotated tag `6.0.0` 并推送对应 commit/tag，随后核对远端 SHA。GitHub 使用统一 SSH key 与 `127.0.0.1:7890` 代理，无直连回退，也不创建 GitHub Actions。普通开发 commit 不自动 push。
+部署对照当前运行 commit：纯前端、文档、测试和版本号改动不碰数据库；其余改动停机后备份双库并校验，只有 schema 变化才迁移。现有 `StockGod-0900-EnsureRunning` 计划任务发现待激活回执后启动候选；命令确认 `/readyz`、版本、commit 和进程身份才创建本地 annotated tag。每阶段耗时会输出到终端。更新前必须安装该计划任务。
 
-本机 Codex 的 PowerShell 环境若继承了 `SHELL=...powershell.exe`，OpenSSH 的代理命令会因不支持 `exec` 而失败。执行 GitHub SSH 命令时仅在该进程设置 `$env:SHELL='H:/Program Files (x86)/Git/bin/bash.exe'`，继续使用原 SSH 配置中的账户 key、443 端口和代理。
+只有用户要求升级到新的 `X.0.0` 时，成功本地部署并打 tag 后才通过配置好的 SSH 代理原子推送 `main` 和 tag，再核对远端 SHA。其他版本不写 GitHub；不创建 GitHub Release 或 Actions。普通开发 commit 不自动部署或 push。
 
-部署校验候选和回执，停止已识别进程，备份双库，迁移并验证数据库，先验证候选服务，再开启调度；完成后核对 `/readyz`、进程身份和浏览器版本。中断后用 `recover` 恢复未完成的部署；失败时按部署回执恢复双库及旧指针：
+本机 Codex 的 PowerShell 环境若继承了 `SHELL=...powershell.exe`，OpenSSH 的代理命令会因不支持 `exec` 而失败；更新命令仅在 GitHub 子步骤为该进程改设 Git Bash，继续使用账户 key、443 端口和 `127.0.0.1:7890` 代理，无直连回退。
+
+激活失败时回到旧版本；有双库备份时按回执恢复数据库，纯前端更新只恢复旧指针。中断后用 `recover` 检查待处理回执；需要手动回退时：
 
 ```powershell
-uv run --frozen python scripts/release.py rollback --receipt <runtime/deployments中的receipt.json>
-uv run --frozen python scripts/release.py recover
+pwsh -File scripts/release.ps1 -Command recover
+pwsh -File scripts/release.ps1 -Command rollback --receipt <runtime/deployments中的receipt.json>
 ```
 
-归档的旧 Go 可执行文件只用于已有部署回执的回滚；当前开发、构建和运行均使用 Python。
+6.0.0 的双离线链路与真实行情/模型预测是已完成的一次性迁移验收，不适用于后续普通更新。归档的旧 Go 可执行文件只用于已有部署回执的回滚；当前开发、构建和运行均使用 Python。

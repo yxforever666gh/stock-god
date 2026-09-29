@@ -2,7 +2,7 @@
 
 Stock God 是 Python、Vue 3 和 SQLite 构建的本地股票预测工具。界面聚焦**股票预测、设置、关于**；完整行情 API、分钟数据与 MCP 独立保留。
 
-[运行与发布](docs/operations.md) · [结构与维护](docs/architecture.md) · [数据接口](docs/data-apis.md) · [发布历史](RELEASE_NOTES.md) · [GitHub](https://github.com/yxforever666gh/stock-god)
+[运行与更新](docs/operations.md) · [结构与维护](docs/architecture.md) · [数据接口](docs/data-apis.md) · [发布历史](RELEASE_NOTES.md) · [GitHub](https://github.com/yxforever666gh/stock-god)
 
 > 本项目由公开项目 [ArvinLovegood/go-stock](https://github.com/ArvinLovegood/go-stock) 演化而来，并非原作者官方仓库。原始版权、[LICENSE](LICENSE) 和 [NOTICE](NOTICE) 保留。
 
@@ -46,6 +46,6 @@ pwsh -File scripts/verify.ps1 -Tier fast -TestPath tests/prediction/test_predict
 pwsh -File scripts/verify.ps1 -Tier domain -Domain contracts
 ```
 
-约束见 [AGENTS.md](AGENTS.md)。普通开发不自动升版本、发布或 push；发布必须完成候选身份、链路验证、备份、部署和运行版本核对。
+约束见 [AGENTS.md](AGENTS.md)。普通开发不自动升版本或部署；请求本地版本更新时使用 `scripts/update-local.ps1` 完成领域验证、快照、受控激活和本地 tag。只有新的 `X.0.0` 会推送对应提交与 tag 到 GitHub。
 
 本工具使用模拟账户，AI 输出供学习研究，不构成投资建议。

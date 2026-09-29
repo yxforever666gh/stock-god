@@ -29,7 +29,8 @@ These rules apply to the whole repository. Keep ordinary work local and bounded.
 - Routine implementation uses `scripts/verify.ps1 -Tier fast -TestPath <pytest target>` or `-FrontendTest <frontend test>`. Cross-boundary work uses one matching `-Tier domain -Domain prediction|market|storage|web|contracts`.
 - API changes update canonical `api/openapi.yaml`, regenerate TS with `python -m stock_god.contracts --write`, and check real FastAPI routes. Never edit generated TS independently as the final state.
 - Run affected frontend behavior tests when requests, pages or charts change. `tests/test_boundaries.py` guards package imports, retired surfaces, runtime language and version consistency.
-- Use `-Tier release` only for an explicit release or an explicit full-gate request. Do not automatically run every test, builds, database maintenance, deployments, version bumps, tags or pushes.
+- A requested local version update uses the affected `-Tier domain` checks and frontend behavior tests. A requested new `X.0.0` runs `-Tier major`: all offline tests, contracts and frontend build, without routine lint or type checks. `-Tier release` is only for an explicit full-gate request.
+- Ordinary fixes do not automatically build, deploy, bump versions or add tags. A requested version update uses `scripts/update-local.ps1` after the final commit, with the affected domain and frontend test paths.
 - Do not repeat a passing check unless relevant code changed or an unresolved risk requires it. After two failures with the same cause, stop rerunning and diagnose.
 - Report unrelated/pre-existing failures separately. They do not expand the task silently.
 - Target three minutes for fast, eight minutes for a domain check, and 10–20 minutes for a routine fix. Major releases are separate work.
@@ -45,10 +46,11 @@ These rules apply to the whole repository. Keep ordinary work local and bounded.
 
 ## Release and completion
 
-- Ordinary commits remain local. GitHub writes, release creation, tags and pushes require the user's explicit scope; use their configured SSH identity and proxy, with no direct fallback or GitHub Actions.
+- Ordinary commits remain local. For this project, a request to upgrade to a new `X.0.0` authorizes pushing only its verified commit and annotated tag through the configured SSH identity and proxy. Every other version gets a local annotated tag and no GitHub write. Never create a GitHub Release or Actions workflow.
 - Versions come from `src/stock_god/release_manifest.json` and must agree with project metadata and runtime identity. Do not bump versions for routine fixes.
-- The approved 6.0.0 migration requires two independent offline chains and one isolated live market/AI prediction before tag/push. Temporary test databases and raw output stay outside Git; bind sanitized receipts to the final commit, dependency lock and artifact hashes.
-- Deployment verifies the candidate and receipts, backs up both databases, applies explicit migrations, restarts once and verifies process/readiness/browser identity. Never move or overwrite a published tag.
+- The 6.0.0 language/data migration was a one-time historical acceptance, not a gate for later versions. Temporary test databases and logs stay outside Git.
+- Local updates use a versioned source/frontend snapshot and a reusable dependency-locked Python environment. Pure frontend/version/documentation updates skip database work; backend or dependency changes back up both databases, verify them, and migrate only when the schema changes. The existing scheduled task owns activation; verify process identity, `/readyz`, and the version before tagging. Preserve older artifacts and deployment receipts for rollback.
+- Failed checks or activation do not create a tag. Never move or overwrite a published tag. A failed major-version GitHub push leaves the successful local deployment/tag intact and must be reported.
 - Only one task writes a checkout. Parallel writers use separate Git worktrees and preserve unrelated local changes.
 - Completion requires the requested behavior, targeted checks, boundary contracts and `git diff --check`, with no unrelated changes. Stop after those conditions hold.
 - End with a short Complexity change note: production lines added/removed, source files touched, execution paths added/removed, public interfaces/configuration/schema added, and any old path still retained. Count physical lines; report prompts, tests, docs, generated metadata and data assets separately.

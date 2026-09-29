@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('fast','domain','release')][string]$Tier = 'fast',
+    [ValidateSet('fast','domain','major','release')][string]$Tier = 'fast',
     [ValidateSet('prediction','market','storage','web','contracts')][string]$Domain,
     [string[]]$TestPath,
     [string[]]$FrontendTest
@@ -27,7 +27,7 @@ try {
             'contracts' { @('tests/test_contracts.py','tests/test_boundaries.py') }
         }
     }
-    if ($Tier -eq 'release') { $paths = @('tests') }
+    if ($Tier -in @('major','release')) { $paths = @('tests') }
     if (-not $paths.Count -and -not $FrontendTest.Count) { throw 'Choose -TestPath, -FrontendTest, or -Domain for local verification.' }
     if ($paths.Count) {
         foreach ($path in $paths) {
@@ -36,19 +36,24 @@ try {
                 throw "Unknown project test target: $path"
             }
         }
-        $marker = if ($Tier -eq 'release' -or $Domain -eq 'storage') { 'not live and not browser' } else { 'not migration and not live and not browser' }
+        $marker = if ($Tier -in @('major','release') -or $Domain -eq 'storage') { 'not live and not browser' } else { 'not migration and not live and not browser' }
         Invoke-Check $pythonCommand (@('-m','pytest','-q','--tb=short','-m',$marker,'--basetemp',(Join-Path $temporaryDirectory 'pytest')) + $paths)
     }
     if ($Tier -eq 'release') {
         Invoke-Check $pythonCommand @('-m','ruff','check','src/stock_god','scripts/release.py')
         Invoke-Check $pythonCommand @('-m','pyright')
+    }
+    if ($Tier -in @('major','release')) {
         Invoke-Check $pythonCommand @('-m','stock_god.contracts')
     }
-    if ($Tier -eq 'release' -or $FrontendTest.Count) {
+    if ($Tier -in @('major','release') -or $FrontendTest.Count) {
         Push-Location (Join-Path $projectDirectory 'frontend')
         try {
             if ($Tier -eq 'release') {
                 Invoke-Check 'npm.cmd' @('run','lint')
+                Invoke-Check 'npm.cmd' @('run','test:runtime')
+                Invoke-Check 'npm.cmd' @('run','build')
+            } elseif ($Tier -eq 'major') {
                 Invoke-Check 'npm.cmd' @('run','test:runtime')
                 Invoke-Check 'npm.cmd' @('run','build')
             } else { Invoke-Check 'node.exe' (@('--test') + $FrontendTest) }

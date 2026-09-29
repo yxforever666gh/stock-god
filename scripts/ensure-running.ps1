@@ -61,7 +61,18 @@ if ($Mode -eq 'Once') {
 $checkedDay = $null
 while ($true) {
     $now = Get-Date
-    if ($null -eq $checkedDay -or (
+    $pendingPath = Join-Path $projectDirectory 'runtime\deployments\pending.json'
+    $activate = $false
+    if (Test-Path -LiteralPath $pendingPath) {
+        try {
+            $pending = Get-Content -LiteralPath $pendingPath -Raw | ConvertFrom-Json
+            $receipt = Get-Content -LiteralPath $pending.receipt -Raw | ConvertFrom-Json
+            $activate = $receipt.formatVersion -eq 3 -and $receipt.status -eq 'activating'
+        } catch {
+            Write-CheckLog "action=pending-read-failed reason=$($_.Exception.Message)"
+        }
+    }
+    if ($activate -or $null -eq $checkedDay -or (
         $now.Date -gt $checkedDay -and $now.TimeOfDay -ge [TimeSpan]::FromHours(9)
     )) {
         $checkedDay = $now.Date

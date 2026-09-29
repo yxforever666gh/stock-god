@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -410,6 +411,26 @@ def bundle_files(directory):
     return tree_files(directory, ("build-manifest.json",))
 
 
+def environment_key(directory, interpreter):
+    """Ignore only this project's version; every dependency and Python change gets a new environment."""
+    project = tomllib.loads((directory / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((directory / "uv.lock").read_text(encoding="utf-8"))
+    if project["project"]["name"] != "stock-god":
+        raise ValueError("unexpected project in dependency metadata")
+    project["project"]["version"] = ""
+    own = [package for package in lock["package"] if package["name"] == "stock-god"]
+    if len(own) != 1:
+        raise ValueError("dependency lock lacks the local project")
+    own[0]["version"] = ""
+    content = json.dumps(
+        [project, lock, digest(interpreter)],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def verify_bundle(directory, *, root=ROOT):
     release_root = inside(root / "runtime/releases", root)
     directory = inside(directory, release_root)
@@ -426,26 +447,57 @@ def verify_bundle(directory, *, root=ROOT):
             raise ValueError("candidate file hash mismatch: " + name)
     if manifest["files"] != actual_files:
         raise ValueError("candidate contains unrecorded files")
-    required = {".venv/Scripts/python.exe", ".venv/pyvenv.cfg", "src/stock_god/release_manifest.json"}
-    if not required <= set(actual_files):
-        raise ValueError("candidate lacks a sealed Python environment or release manifest")
     toolchain = inside(root / "runtime/toolchain", root)
     interpreter = inside(manifest["interpreterExecutable"], toolchain)
     if digest(interpreter) != manifest["interpreterSHA256"]:
         raise ValueError("release interpreter hash mismatch")
-    runtime = inside(manifest["interpreterDirectory"], toolchain)
-    if interpreter.parent != runtime or not manifest.get("interpreterFiles"):
-        raise ValueError("interpreter directory is not sealed")
-    if tree_files(runtime) != manifest["interpreterFiles"]:
-        raise ValueError("release interpreter/standard library fingerprint mismatch")
+    if manifest.get("formatVersion") == 3:
+        required = {
+            "src/stock_god/release_manifest.json",
+            "frontend/dist/index.html",
+            "pyproject.toml",
+            "uv.lock",
+            ".python-version",
+        }
+        if not required <= set(actual_files):
+            raise ValueError("snapshot lacks source, frontend, or dependency metadata")
+        environments = inside(toolchain / "envs", toolchain)
+        environment = inside(manifest["environmentDirectory"], environments)
+        expected_key = environment_key(directory, interpreter)
+        if manifest.get("environmentKey") != expected_key or environment.name != expected_key:
+            raise ValueError("snapshot dependency environment key mismatch")
+        env_manifest = read(environment / "env-manifest.json")
+        if env_manifest != {
+            "environmentKey": expected_key,
+            "interpreterExecutable": str(interpreter),
+            "interpreterSHA256": manifest["interpreterSHA256"],
+        }:
+            raise ValueError("shared Python environment identity mismatch")
+        python = environment / ".venv/Scripts/python.exe"
+        config_path = environment / ".venv/pyvenv.cfg"
+        if not python.is_file() or not config_path.is_file():
+            raise ValueError("shared Python environment is incomplete")
+    elif manifest.get("formatVersion", 2) == 2:
+        required = {".venv/Scripts/python.exe", ".venv/pyvenv.cfg", "src/stock_god/release_manifest.json"}
+        if not required <= set(actual_files):
+            raise ValueError("candidate lacks a sealed Python environment or release manifest")
+        runtime = inside(manifest["interpreterDirectory"], toolchain)
+        if interpreter.parent != runtime or not manifest.get("interpreterFiles"):
+            raise ValueError("interpreter directory is not sealed")
+        if tree_files(runtime) != manifest["interpreterFiles"]:
+            raise ValueError("release interpreter/standard library fingerprint mismatch")
+        python = directory / ".venv/Scripts/python.exe"
+        config_path = directory / ".venv/pyvenv.cfg"
+    else:
+        raise ValueError("unknown snapshot format")
     config = dict(
         line.split("=", 1)
-        for line in (directory / ".venv/pyvenv.cfg").read_text(encoding="utf-8").splitlines()
+        for line in config_path.read_text(encoding="utf-8").splitlines()
         if "=" in line
     )
     config = {key.strip(): value.strip() for key, value in config.items()}
     if (
-        Path(config.get("home", "")).resolve() != runtime
+        Path(config.get("home", "")).resolve() != interpreter.parent
         or config.get("include-system-site-packages", "").lower() != "false"
     ):
         raise ValueError("venv is not bound exclusively to the sealed interpreter")
@@ -461,7 +513,7 @@ def verify_bundle(directory, *, root=ROOT):
         },
         "kind": "python",
         "releaseDirectory": str(directory),
-        "pythonExecutable": str(directory / ".venv/Scripts/python.exe"),
+        "pythonExecutable": str(python),
         "interpreterExecutable": str(interpreter),
         "artifactSHA256": digest(manifest_path),
     }
@@ -498,7 +550,55 @@ def release_env(pointer, root=ROOT, *, scheduler=True):
     return env
 
 
-def build(root, uv):
+def changed_paths(root, before, after):
+    return set(
+        run(["git", "diff", "--name-only", "--no-renames", before, after], cwd=root, capture=True).splitlines()
+    )
+
+
+def version_metadata_only(root, before, after, name):
+    old = run(["git", "show", before + ":" + name], cwd=root, capture=True)
+    new = run(["git", "show", after + ":" + name], cwd=root, capture=True)
+    if name == "src/stock_god/release_manifest.json":
+        old, new = json.loads(old), json.loads(new)
+        old["appVersion"] = new["appVersion"] = ""
+    else:
+        old, new = tomllib.loads(old), tomllib.loads(new)
+        if name == "pyproject.toml":
+            old["project"]["version"] = new["project"]["version"] = ""
+        else:
+            for lock in (old, new):
+                own = [package for package in lock["package"] if package["name"] == "stock-god"]
+                if len(own) != 1:
+                    return False
+                own[0]["version"] = ""
+    return old == new
+
+
+def database_backup_required(root, before, candidate):
+    if any(
+        before[key] != candidate[key] for key in ("mainSchemaVersion", "minuteSchemaVersion")
+    ):
+        return True
+    try:
+        names = changed_paths(root, before["commit"], candidate["commit"])
+        version_only = {"pyproject.toml", "uv.lock", "src/stock_god/release_manifest.json"}
+        for name in names:
+            if name in version_only:
+                if not version_metadata_only(root, before["commit"], candidate["commit"], name):
+                    return True
+            elif name.startswith(("frontend/", "docs/", "tests/")):
+                continue
+            elif name in {"README.md", "RELEASE_NOTES.md", "AGENTS.md", "LICENSE", "NOTICE", ".gitignore"}:
+                continue
+            else:
+                return True
+        return False
+    except (KeyError, ValueError, subprocess.CalledProcessError):
+        return True  # Unknown histories or metadata always retain both database backups.
+
+
+def build(root, uv, *, frontend_ready=False, frontend_deps_ready=False):
     commit = clean_commit(root)
     version = read(root / "src/stock_god/release_manifest.json")
     destination = root / "runtime/releases" / version["appVersion"] / commit
@@ -528,58 +628,84 @@ def build(root, uv):
     env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost,::1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     python_version = (root / ".python-version").read_text(encoding="utf-8").strip()
-    run([uv, "python", "install", python_version], env=env, cwd=root)
-    interpreter = Path(
-        run(
+    try:
+        found = run(
             [uv, "python", "find", "--managed-python", "--system", python_version],
             env=env,
             cwd=root,
             capture=True,
         )
-    )
+    except subprocess.CalledProcessError:
+        run([uv, "python", "install", python_version], env=env, cwd=root)
+        found = run(
+            [uv, "python", "find", "--managed-python", "--system", python_version],
+            env=env,
+            cwd=root,
+            capture=True,
+        )
+    interpreter = Path(found)
     inside(interpreter, root / "runtime/toolchain")
-    npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")
-    if not npm:
-        raise RuntimeError("npm is unavailable")
-    run([npm, "ci", "--no-audit", "--no-fund"], cwd=root / "frontend", env=env)
-    run([npm, "run", "build"], cwd=root / "frontend", env=env)
+    key = environment_key(root, interpreter)
+    environment = root / "runtime/toolchain/envs" / key
+    env_manifest = {
+        "environmentKey": key,
+        "interpreterExecutable": str(interpreter),
+        "interpreterSHA256": digest(interpreter),
+    }
+    if not (environment / "env-manifest.json").is_file() or read(environment / "env-manifest.json") != env_manifest:
+        environment.mkdir(parents=True, exist_ok=True)
+        env["UV_PROJECT_ENVIRONMENT"] = str(environment / ".venv")
+        run(
+            [uv, "sync", "--frozen", "--no-dev", "--no-install-project", "--python", interpreter],
+            cwd=root,
+            env=env,
+        )
+        write(environment / "env-manifest.json", env_manifest)
+    pointer_path = root / "runtime/current.json"
+    previous = verify_pointer(read(pointer_path), root) if pointer_path.is_file() else None
+    prior_dist = (
+        Path(previous["releaseDirectory"]) / "frontend/dist"
+        if previous and previous.get("kind") == "python" and previous.get("commit")
+        else None
+    )
+    frontend_changed = not previous or any(
+        name.startswith("frontend/") for name in changed_paths(root, previous["commit"], commit)
+    )
+    if not frontend_ready and (frontend_changed or prior_dist is None or not prior_dist.is_dir()):
+        npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")
+        if not npm:
+            raise RuntimeError("npm is unavailable")
+        lock_changed = not previous or "frontend/package-lock.json" in changed_paths(
+            root, previous["commit"], commit
+        )
+        if not frontend_deps_ready and (lock_changed or not (root / "frontend/node_modules").is_dir()):
+            run([npm, "ci", "--no-audit", "--no-fund"], cwd=root / "frontend", env=env)
+        run([npm, "run", "build"], cwd=root / "frontend", env=env)
+    dist = root / "frontend/dist" if frontend_ready or frontend_changed or prior_dist is None else prior_dist
+    if not (dist / "index.html").is_file():
+        raise ValueError("built frontend is missing index.html")
     destination.mkdir(parents=True)
-    # A bundle is assembled at its final path because Windows venvs are not relocatable.
-    for name in ("src/stock_god", "api", "frontend/dist"):
+    for name in ("src/stock_god", "api"):
         shutil.copytree(
             root / name, destination / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
         )
+    shutil.copytree(dist, destination / "frontend/dist")
     for name in ("pyproject.toml", "uv.lock", ".python-version", "LICENSE", "NOTICE"):
         if (root / name).is_file():
             shutil.copy2(root / name, destination / name)
-    env["UV_PROJECT_ENVIRONMENT"] = str(destination / ".venv")
-    run(
-        [
-            uv,
-            "sync",
-            "--frozen",
-            "--no-dev",
-            "--no-install-project",
-            "--python",
-            interpreter,
-            "--project",
-            destination,
-        ],
-        cwd=destination,
-        env=env,
-    )
     if clean_commit(root) != commit:
-        raise RuntimeError("checkout changed during release build; candidate remains unsealed")
+        raise RuntimeError("checkout changed during snapshot build; candidate remains unsealed")
     manifest = {
         **version,
+        "formatVersion": 3,
         "commit": commit,
         "buildTime": timestamp(),
         "dirty": False,
         "pythonVersion": python_version,
         "interpreterExecutable": str(interpreter),
         "interpreterSHA256": digest(interpreter),
-        "interpreterDirectory": str(interpreter.parent),
-        "interpreterFiles": tree_files(interpreter.parent),
+        "environmentKey": key,
+        "environmentDirectory": str(environment),
         "files": bundle_files(destination),
     }
     write(destination / "build-manifest.json", manifest)
@@ -850,18 +976,95 @@ def ensure_running(pointer, root=ROOT):
     return {"action": "restarted" if was_listening else "started", "ready": start(pointer, root)}
 
 
+def snapshot_format(pointer):
+    return read(Path(pointer["releaseDirectory"]) / "build-manifest.json").get("formatVersion", 2)
+
+
+def version_parts(value):
+    parts = str(value).split(".")
+    if len(parts) != 3 or any(not part.isdecimal() for part in parts):
+        raise ValueError("app version must use X.Y.Z")
+    return tuple(int(part) for part in parts)
+
+
+def update_plan(root):
+    commit = clean_commit(root)
+    manifest = read(root / "src/stock_god/release_manifest.json")
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    lock = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8"))
+    version = manifest["appVersion"]
+    own = [package for package in lock["package"] if package["name"] == "stock-god"]
+    if project["project"]["version"] != version or len(own) != 1 or own[0]["version"] != version:
+        raise ValueError("manifest, project, and dependency lock versions differ")
+    before = read(root / "runtime/current.json")
+    old = version_parts(before["appVersion"])
+    new = version_parts(version)
+    if new <= old:
+        raise ValueError("update version must exceed the deployed version")
+    existing = run(["git", "tag", "--list", version], cwd=root, capture=True)
+    if existing:
+        raise ValueError("version tag already exists: " + version)
+    names = changed_paths(root, before["commit"], commit)
+    return {
+        "appVersion": version,
+        "commit": commit,
+        "major": new[0] > old[0] and new[1:] == (0, 0),
+        "frontendChanged": any(name.startswith("frontend/") for name in names),
+        "frontendLockChanged": "frontend/package-lock.json" in names,
+        "backendChanged": database_backup_required(root, before, {**manifest, "commit": commit}),
+    }
+
+
+def make_proof(directory, evidence, domains, root):
+    candidate = verify_bundle(directory, root=root)
+    if snapshot_format(candidate) != 3:
+        raise ValueError("automatic verification is only for lightweight snapshots")
+    evidence = Path(evidence).resolve()
+    if not evidence.is_file():
+        raise ValueError("verification log is missing")
+    major = version_parts(candidate["appVersion"])[1:] == (0, 0)
+    if not major and not domains:
+        raise ValueError("a small version requires affected domains")
+    stage = "major-offline" if major else "domain"
+    proof_path = evidence.parent / "proof.json"
+    write(
+        proof_path,
+        {
+            "commit": candidate["commit"],
+            "artifactSHA256": candidate["artifactSHA256"],
+            "dependencyLockSHA256": digest(Path(candidate["releaseDirectory"]) / "uv.lock"),
+            "domains": domains,
+            "stages": {
+                stage: {
+                    "passed": True,
+                    "evidencePath": evidence.name,
+                    "evidenceSHA256": digest(evidence),
+                }
+            },
+        },
+    )
+    validate_proof(proof_path, candidate)
+    return {"proof": str(proof_path), "stage": stage}
+
+
 def validate_proof(path, pointer):
+    if snapshot_format(pointer) != 3:
+        raise ValueError("older artifacts are retained for rollback only")
     path = Path(path).resolve()
     proof = read(path)
     for key in ("commit", "artifactSHA256"):
         if proof.get(key) != pointer[key]:
             raise ValueError("acceptance belongs to a different candidate: " + key)
-    allowed = {"local-release-gate", "offline-cold", "offline-restart", "live-prediction"}
-    # The complete language/data migration has explicit additional acceptance.
-    # Routine later releases must not silently require external AI calls.
-    required = allowed if pointer["appVersion"] == "6.0.0" else {"local-release-gate"}
+    major = version_parts(pointer["appVersion"])[1:] == (0, 0)
+    required = {"major-offline" if major else "domain"}
+    if proof.get("dependencyLockSHA256") != digest(
+        Path(pointer["releaseDirectory"]) / "uv.lock"
+    ):
+        raise ValueError("acceptance dependency lock differs from candidate")
+    if not major and not proof.get("domains"):
+        raise ValueError("domain acceptance must name the affected domains")
     stages = proof.get("stages", {})
-    if not required <= set(stages) <= allowed or any(
+    if set(stages) != required or any(
         stage.get("passed") is not True for stage in stages.values()
     ):
         raise ValueError("candidate acceptance is incomplete")
@@ -941,7 +1144,34 @@ def resume_before(receipt, root):
     return receipt
 
 
+def rollback_without_backup(receipt, root):
+    before = verify_pointer(receipt["before"], root)
+    candidate = verify_pointer(receipt["candidate"], root)
+    current = read(root / "runtime/current.json")
+    if pointer_key(current) not in (pointer_key(before), pointer_key(candidate)):
+        raise RuntimeError("rollback receipt does not match the current deployment")
+    if receipt.get("status") == "rolled_back":
+        return receipt
+    record = process_record(root)
+    active = (
+        candidate
+        if record and pointer_key(record["pointer"]) == pointer_key(candidate)
+        else before
+    )
+    stop(active, root)
+    stop_maintenance(root)
+    assert_writers_stopped(root)
+    write(root / "runtime/current.json", before)
+    state = start(before, root)
+    receipt.update(status="rolled_back", rolledBackAt=timestamp(), rollbackReady=state)
+    receipt_write(receipt)
+    clear_pending(root, receipt)
+    return receipt
+
+
 def restore(receipt, root):
+    if receipt.get("backupMode") == "none":
+        return rollback_without_backup(receipt, root)
     before = verify_pointer(receipt["before"], root)
     directory = inside(receipt["directory"], root / "runtime/deployments")
     if receipt.get("status") == "rolled_back":
@@ -994,7 +1224,7 @@ def restore(receipt, root):
     return receipt
 
 
-def recover_pending(root):
+def recover_pending(root, *, activate=False):
     path = root / "runtime/deployments/pending.json"
     if not path.exists():
         return None
@@ -1007,6 +1237,26 @@ def recover_pending(root):
     if status in ("deployed", "rolled_back", "aborted"):
         clear_pending(root, receipt)
         return receipt
+    if receipt.get("formatVersion") == 3 and status == "activating":
+        candidate = verify_pointer(receipt["candidate"], root)
+        if pointer_key(read(root / "runtime/current.json")) != pointer_key(candidate):
+            return restore(receipt, root) if receipt["backupMode"] == "full" else resume_before(
+                receipt, root
+            )
+        if activate:
+            try:
+                state = start(candidate, root)
+                candidate["deployedAt"] = timestamp()
+                write(root / "runtime/current.json", candidate)
+                receipt.update(status="deployed", ready=state, completedAt=timestamp())
+                receipt_write(receipt)
+                clear_pending(root, receipt)
+                return receipt
+            except BaseException as error:
+                receipt["failure"] = str(error)
+                receipt_write(receipt)
+                restore(receipt, root)
+                raise
     # A process can become ready just before its controller dies. Complete the
     # already-active cutover instead of discarding legitimate subsequent data.
     if status in ("activating", "restored"):
@@ -1038,6 +1288,8 @@ def recover_pending(root):
     stop_maintenance(root)
     if status == "restored":
         return resume_before(receipt, root)
+    if receipt.get("backupMode") == "none":
+        return rollback_without_backup(receipt, root)
     if len(receipt.get("backups", {})) == 2:
         return restore(receipt, root)
     if status not in ("prepared", "stopped"):
@@ -1046,19 +1298,18 @@ def recover_pending(root):
     return resume_before(receipt, root)
 
 
-def deploy(directory, proof_path, root):
+def deploy_snapshot(directory, proof_path, root):
     candidate = verify_bundle(directory, root=root)
     proof = validate_proof(proof_path, candidate)
     recovered = recover_pending(root)
-    if (
-        recovered
-        and recovered["status"] == "deployed"
-        and pointer_key(recovered["candidate"]) == pointer_key(candidate)
-    ):
+    if recovered and recovered["status"] == "deployed" and pointer_key(
+        recovered["candidate"]
+    ) == pointer_key(candidate):
         return recovered
     before = verify_pointer(read(root / "runtime/current.json"), root)
     if pointer_key(before) == pointer_key(candidate):
-        return {"status": "deployed", "ready": start(before, root), "reused": True}
+        return {"status": "deployed", "reused": True}
+    backup_mode = "full" if database_backup_required(root, before, candidate) else "none"
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     deployment = root / "runtime/deployments" / stamp
     deployment.mkdir(parents=True)
@@ -1070,51 +1321,45 @@ def deploy(directory, proof_path, root):
         "status": "prepared",
         "createdAt": timestamp(),
         "backups": {},
-        "formatVersion": 2,
+        "backupMode": backup_mode,
+        "formatVersion": 3,
         "acceptanceSHA256": digest(proof_path),
     }
-    receipt_path = deployment / "receipt.json"
-    write(receipt_path, receipt)
-    write(root / "runtime/deployments/pending.json", {"receipt": str(receipt_path)})
+    receipt_write(receipt)
+    write(root / "runtime/deployments/pending.json", {"receipt": str(deployment / "receipt.json")})
     try:
         stop(before, root)
         receipt["status"] = "stopped"
         receipt_write(receipt)
         with process_lock(root / "runtime/web.lock"):
             assert_writers_stopped(root)
-            with database_guard(root):
-                for name in ("stock.db", "minute.db"):
-                    receipt["backups"][name] = backup_database(
-                        root / "data" / name, deployment / "backup" / name
-                    )
-                    expected_version = before[
-                        "mainSchemaVersion" if name == "stock.db" else "minuteSchemaVersion"
-                    ]
-                    if backup_version(deployment / "backup" / name) != expected_version:
-                        raise ValueError("source database schema differs from running release: " + name)
+            if backup_mode == "full":
+                with database_guard(root):
+                    for name in ("stock.db", "minute.db"):
+                        receipt["backups"][name] = backup_database(
+                            root / "data" / name, deployment / "backup" / name
+                        )
+                        expected = before[
+                            "mainSchemaVersion" if name == "stock.db" else "minuteSchemaVersion"
+                        ]
+                        if backup_version(deployment / "backup" / name) != expected:
+                            raise ValueError("source database schema differs from running release: " + name)
+                        receipt_write(receipt)
+                receipt["status"] = "backed_up"
+                receipt_write(receipt)
+                if any(
+                    before[key] != candidate[key]
+                    for key in ("mainSchemaVersion", "minuteSchemaVersion")
+                ):
+                    receipt["status"] = "migrating"
                     receipt_write(receipt)
-            receipt["status"] = "backed_up"
-            receipt_write(receipt)
-            receipt["status"] = "migrating"
-            receipt_write(receipt)
-            receipt["migration"] = json.loads(database_command(candidate, root, "migrate"))
-            receipt["verification"] = json.loads(database_command(candidate, root, "verify"))
-            assert_writers_stopped(root)
-        receipt["status"] = "migrated"
-        receipt_write(receipt)
-        start(candidate, root, scheduler=False)
-        stop(candidate, root)
+                    receipt["migration"] = json.loads(database_command(candidate, root, "migrate"))
+                receipt["verification"] = json.loads(database_command(candidate, root, "verify"))
+                assert_writers_stopped(root)
+        write(root / "runtime/current.json", candidate)
         receipt["status"] = "activating"
         receipt_write(receipt)
-        # Persist activation intent before enabling production scheduling.
-        write(root / "runtime/current.json", candidate)
-        receipt["ready"] = start(candidate, root, scheduler=True)
-        candidate["deployedAt"] = timestamp()
-        write(root / "runtime/current.json", candidate)
-        receipt.update(status="deployed", completedAt=timestamp())
-        receipt_write(receipt)
-        clear_pending(root, receipt)
-        return receipt
+        return receipt  # The existing scheduled task owns the single production start.
     except BaseException as error:
         receipt["failure"] = str(error)
         receipt_write(receipt)
@@ -1122,16 +1367,17 @@ def deploy(directory, proof_path, root):
             receipt["status"] = "aborted"
             receipt_write(receipt)
             clear_pending(root, receipt)
-            raise
-        if len(receipt["backups"]) == 2:
+        elif len(receipt["backups"]) == 2:
             restore(receipt, root)
         else:
-            # No migration was started, so neither source database was changed.
-            start(before, root)
-            receipt.update(status="rolled_back", rolledBackAt=timestamp())
-            receipt_write(receipt)
-            clear_pending(root, receipt)
+            resume_before(receipt, root)
         raise
+
+
+def deploy(directory, proof_path, root):
+    if read(Path(directory) / "build-manifest.json").get("formatVersion") != 3:
+        raise ValueError("older artifacts are retained for rollback only")
+    return deploy_snapshot(directory, proof_path, root)
 
 
 def main(argv=None):
@@ -1140,8 +1386,15 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     builder = commands.add_parser("build")
     builder.add_argument("--uv", type=Path, required=True)
+    builder.add_argument("--frontend-ready", action="store_true")
+    builder.add_argument("--frontend-deps-ready", action="store_true")
+    commands.add_parser("plan")
     inspector = commands.add_parser("inspect")
     inspector.add_argument("--candidate", type=Path, required=True)
+    proofer = commands.add_parser("proof")
+    proofer.add_argument("--candidate", type=Path, required=True)
+    proofer.add_argument("--evidence", type=Path, required=True)
+    proofer.add_argument("--domain", action="append", default=[])
     deployer = commands.add_parser("deploy")
     deployer.add_argument("--candidate", type=Path, required=True)
     deployer.add_argument("--proof", type=Path, required=True)
@@ -1154,9 +1407,18 @@ def main(argv=None):
     root = args.root.resolve()
     with process_lock(root / "runtime/deployments/release.lock"):
         if args.command == "build":
-            result = build(root, args.uv.resolve())
+            result = build(
+                root,
+                args.uv.resolve(),
+                frontend_ready=args.frontend_ready,
+                frontend_deps_ready=args.frontend_deps_ready,
+            )
+        elif args.command == "plan":
+            result = update_plan(root)
         elif args.command == "inspect":
             result = verify_bundle(args.candidate, root=root)
+        elif args.command == "proof":
+            result = make_proof(args.candidate, args.evidence, args.domain, root)
         elif args.command == "deploy":
             result = deploy(args.candidate, args.proof, root)
         elif args.command == "rollback":
@@ -1166,7 +1428,7 @@ def main(argv=None):
             result = recover_pending(root) or {"status": "no_pending_deployment"}
         else:
             if args.command in {"start", "restart", "ensure"}:
-                recover_pending(root)
+                recover_pending(root, activate=args.command == "ensure")
             pointer = verify_pointer(read(root / "runtime/current.json"), root)
             if args.command in {"stop", "restart"}:
                 if args.command == "stop" and (root / "runtime/deployments/pending.json").exists():

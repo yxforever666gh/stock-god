@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import py_compile
+import shutil
 import subprocess
 import sys
 import time
@@ -52,23 +53,67 @@ def candidate(root):
     return directory, release.verify_bundle(directory, root=root)
 
 
-def proof(path, pointer):
-    stages = {}
-    for name in ("local-release-gate", "offline-cold", "offline-restart", "live-prediction"):
-        evidence = path.parent / (name + ".txt")
-        evidence.write_text("passed " + pointer["commit"] + " " + pointer["artifactSHA256"], encoding="utf-8")
-        stages[name] = {
-            "passed": True,
-            "evidencePath": evidence.name,
-            "evidenceSHA256": release.digest(evidence),
-        }
-    value = {
-        "commit": pointer["commit"],
-        "artifactSHA256": pointer["artifactSHA256"],
-        "stages": stages,
-    }
-    release.write(path, value)
-    return value
+def snapshot_candidate(root, *, version="6.0.7", commit="snapshot-commit", schema=36):
+    directory = root / "runtime/releases" / version / commit
+    (directory / "src/stock_god").mkdir(parents=True)
+    (directory / "frontend/dist").mkdir(parents=True)
+    (directory / "frontend/dist/index.html").write_text("snapshot", encoding="utf-8")
+    release.write(
+        directory / "src/stock_god/release_manifest.json",
+        {"appVersion": version, "mainSchemaVersion": schema, "minuteSchemaVersion": 3},
+    )
+    (directory / "pyproject.toml").write_text(
+        f'[project]\nname = "stock-god"\nversion = "{version}"\ndependencies = ["fastapi>=0.1"]\n',
+        encoding="utf-8",
+    )
+    (directory / "uv.lock").write_text(
+        f'version = 1\n[[package]]\nname = "stock-god"\nversion = "{version}"\n'
+        'source = { editable = "." }\ndependencies = [{ name = "fastapi" }]\n'
+        '[[package]]\nname = "fastapi"\nversion = "0.1"\n',
+        encoding="utf-8",
+    )
+    (directory / ".python-version").write_text("3.13", encoding="utf-8")
+    interpreter = root / "runtime/toolchain/python/python.exe"
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
+    interpreter.write_bytes(b"interpreter")
+    key = release.environment_key(directory, interpreter)
+    environment = root / "runtime/toolchain/envs" / key
+    (environment / ".venv/Scripts").mkdir(parents=True, exist_ok=True)
+    (environment / ".venv/Scripts/python.exe").write_bytes(b"shared python")
+    (environment / ".venv/pyvenv.cfg").write_text(
+        f"home = {interpreter.parent}\ninclude-system-site-packages = false\n", encoding="utf-8"
+    )
+    release.write(
+        environment / "env-manifest.json",
+        {
+            "environmentKey": key,
+            "interpreterExecutable": str(interpreter),
+            "interpreterSHA256": release.digest(interpreter),
+        },
+    )
+    release.write(
+        directory / "build-manifest.json",
+        {
+            "formatVersion": 3,
+            "appVersion": version,
+            "mainSchemaVersion": schema,
+            "minuteSchemaVersion": 3,
+            "commit": commit,
+            "dirty": False,
+            "interpreterExecutable": str(interpreter),
+            "interpreterSHA256": release.digest(interpreter),
+            "environmentDirectory": str(environment),
+            "environmentKey": key,
+            "files": release.bundle_files(directory),
+        },
+    )
+    return directory, release.verify_bundle(directory, root=root)
+
+
+def snapshot_proof(root, directory):
+    evidence = root / "verification.log"
+    evidence.write_text("domain verification passed", encoding="utf-8")
+    return Path(release.make_proof(directory, evidence, ["web"], root)["proof"])
 
 
 def legacy(root):
@@ -93,6 +138,8 @@ def legacy(root):
 def test_candidate_seals_environment_and_rejects_extra_files(tmp_path):
     directory, pointer = candidate(tmp_path)
     assert release.verify_pointer(pointer, tmp_path) == pointer
+    with pytest.raises(ValueError, match="rollback only"):
+        release.deploy(directory, tmp_path / "unused-proof.json", tmp_path)
     (directory / "extra.py").write_text("unexpected", encoding="utf-8")
     with pytest.raises(ValueError, match="unrecorded"):
         release.verify_bundle(directory, root=tmp_path)
@@ -104,39 +151,266 @@ def test_candidate_seals_environment_and_rejects_extra_files(tmp_path):
         release.inside(tmp_path / "../outside", tmp_path)
 
 
-def test_acceptance_is_bound_to_final_candidate_and_all_four_stages(tmp_path):
-    _, pointer = candidate(tmp_path)
-    path = tmp_path / "proof.json"
-    value = proof(path, pointer)
-    assert release.validate_proof(path, pointer) == value
-    value["commit"] = "old"
-    release.write(path, value)
-    with pytest.raises(ValueError, match="different candidate"):
-        release.validate_proof(path, pointer)
-    value = proof(path, pointer)
-    value["stages"]["offline-restart"]["passed"] = False
-    release.write(path, value)
-    with pytest.raises(ValueError, match="incomplete"):
-        release.validate_proof(path, pointer)
+def test_snapshot_reuses_locked_environment_across_version_only_updates(tmp_path):
+    first, first_pointer = snapshot_candidate(tmp_path, version="6.0.7", commit="first")
+    second, second_pointer = snapshot_candidate(tmp_path, version="6.0.8", commit="second")
+    assert first_pointer["pythonExecutable"] == second_pointer["pythonExecutable"]
+    assert release.environment_key(first, Path(first_pointer["interpreterExecutable"])) == (
+        release.environment_key(second, Path(second_pointer["interpreterExecutable"]))
+    )
+    (second / "uv.lock").write_text(
+        (second / "uv.lock").read_text(encoding="utf-8").replace('version = "0.1"', 'version = "0.2"'),
+        encoding="utf-8",
+    )
+    assert release.environment_key(second, Path(second_pointer["interpreterExecutable"])) != (
+        release.environment_key(first, Path(first_pointer["interpreterExecutable"]))
+    )
+    with pytest.raises(ValueError, match="hash mismatch"):
+        release.verify_bundle(second, root=tmp_path)
 
 
-def test_later_releases_do_not_require_unrequested_live_provider_calls(tmp_path):
-    _, pointer = candidate(tmp_path)
-    path = tmp_path / "proof.json"
-    value = proof(path, pointer)
-    value["stages"] = {"local-release-gate": value["stages"]["local-release-gate"]}
-    release.write(path, value)
-    with pytest.raises(ValueError, match="incomplete"):
-        release.validate_proof(path, pointer)
-    later = {**pointer, "appVersion": "6.0.1"}
-    assert release.validate_proof(path, later) == value
+def test_snapshot_proof_requires_domain_for_small_version_and_offline_gate_for_major(tmp_path):
+    small, _ = snapshot_candidate(tmp_path, version="6.0.7", commit="small")
+    evidence = tmp_path / "verification.log"
+    evidence.write_text("passed", encoding="utf-8")
+    with pytest.raises(ValueError, match="requires affected domains"):
+        release.make_proof(small, evidence, [], tmp_path)
+    major, pointer = snapshot_candidate(tmp_path, version="7.0.0", commit="major")
+    result = release.make_proof(major, evidence, [], tmp_path)
+    assert result["stage"] == "major-offline"
+    assert release.validate_proof(result["proof"], pointer)["stages"]["major-offline"]["passed"]
+
+
+def test_only_frontend_and_version_metadata_skip_database_backup(tmp_path):
+    def git(*arguments):
+        return subprocess.run(
+            ["git", *arguments], cwd=tmp_path, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    def commit(message):
+        git("add", ".")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", "commit", "-qm", message)
+        return git("rev-parse", "HEAD")
+
+    def version(value):
+        release.write(
+            tmp_path / "src/stock_god/release_manifest.json",
+            {"appVersion": value, "mainSchemaVersion": 36, "minuteSchemaVersion": 3},
+        )
+        (tmp_path / "pyproject.toml").write_text(
+            f'[project]\nname = "stock-god"\nversion = "{value}"\n', encoding="utf-8"
+        )
+        (tmp_path / "uv.lock").write_text(
+            f'version = 1\n[[package]]\nname = "stock-god"\nversion = "{value}"\n'
+            'source = { editable = "." }\n[[package]]\nname = "fastapi"\nversion = "0.1"\n',
+            encoding="utf-8",
+        )
+
+    git("init", "-q")
+    (tmp_path / ".gitignore").write_text("runtime/\n", encoding="utf-8")
+    (tmp_path / "frontend/src").mkdir(parents=True)
+    version("6.0.6")
+    (tmp_path / "frontend/src/app.vue").write_text("old", encoding="utf-8")
+    old = commit("old")
+    version("6.0.7")
+    (tmp_path / "frontend/src/app.vue").write_text("new", encoding="utf-8")
+    frontend = commit("frontend and version")
+    before = {"commit": old, "mainSchemaVersion": 36, "minuteSchemaVersion": 3}
+    candidate = {**before, "commit": frontend}
+    assert not release.database_backup_required(tmp_path, before, candidate)
+    release.write(tmp_path / "runtime/current.json", {**before, "appVersion": "6.0.6"})
+    plan = release.update_plan(tmp_path)
+    assert not plan["major"] and plan["frontendChanged"] and not plan["backendChanged"]
+    (tmp_path / "src/stock_god/app.py").write_text("backend change", encoding="utf-8")
+    backend = commit("backend")
+    assert release.database_backup_required(tmp_path, before, {**candidate, "commit": backend})
+    (tmp_path / "uv.lock").write_text(
+        (tmp_path / "uv.lock").read_text(encoding="utf-8").replace(
+            'version = "0.1"', 'version = "0.2"'
+        ),
+        encoding="utf-8",
+    )
+    dependency = commit("dependency")
+    assert release.database_backup_required(tmp_path, before, {**candidate, "commit": dependency})
+    version("7.0.0")
+    commit("major")
+    assert release.update_plan(tmp_path)["major"]
+
+
+def test_snapshot_build_reuses_environment_and_frontend_for_backend_only_update(
+    tmp_path, monkeypatch
+):
+    old_dir, old_pointer = snapshot_candidate(tmp_path, version="6.0.6", commit="old")
+    release.write(tmp_path / "runtime/current.json", old_pointer)
+    shutil.copytree(old_dir / "src", tmp_path / "src")
+    release.write(
+        tmp_path / "src/stock_god/release_manifest.json",
+        {"appVersion": "6.0.7", "mainSchemaVersion": 36, "minuteSchemaVersion": 3},
+    )
+    (tmp_path / "api").mkdir()
+    (tmp_path / "api/openapi.yaml").write_text("openapi: 3.1.0", encoding="utf-8")
+    for name in ("pyproject.toml", "uv.lock"):
+        (tmp_path / name).write_text(
+            (old_dir / name).read_text(encoding="utf-8").replace("6.0.6", "6.0.7"),
+            encoding="utf-8",
+        )
+    shutil.copy2(old_dir / ".python-version", tmp_path / ".python-version")
+    interpreter = old_pointer["interpreterExecutable"]
+    monkeypatch.setattr(release, "clean_commit", lambda root: "new")
+    monkeypatch.setattr(
+        release,
+        "changed_paths",
+        lambda *args: {"pyproject.toml", "uv.lock", "src/stock_god/release_manifest.json"},
+    )
+
+    def run(args, **kwargs):
+        if args[1:3] == ["python", "find"]:
+            return interpreter
+        pytest.fail("unchanged dependencies or frontend triggered installation/build")
+
+    monkeypatch.setattr(release, "run", run)
+    pointer = release.build(tmp_path, Path("uv.exe"))
+    assert pointer["pythonExecutable"] == old_pointer["pythonExecutable"]
+    assert (Path(pointer["releaseDirectory"]) / "frontend/dist/index.html").read_text() == "snapshot"
+    assert not (tmp_path / "frontend/dist").exists()
+
+
+def test_frontend_snapshot_skips_databases_and_activates_once(tmp_path, monkeypatch):
+    directory, pointer = snapshot_candidate(tmp_path)
+    before = legacy(tmp_path)
+    before["mainSchemaVersion"] = 36
+    release.write(tmp_path / "runtime/current.json", before)
+    fixture_databases(tmp_path)
+    with Database(tmp_path / "data/stock.db").transaction() as db:
+        db.execute("INSERT INTO schema_migrations VALUES(36)")
+    evidence = snapshot_proof(tmp_path, directory)
+    events = []
+    monkeypatch.setattr(release, "database_backup_required", lambda *args: False)
+    monkeypatch.setattr(release, "listener_pid", lambda: None)
+    monkeypatch.setattr(release, "stop", lambda item, root: events.append(("stop", item["commit"])))
+    monkeypatch.setattr(
+        release,
+        "start",
+        lambda item, root, **kw: events.append(("start", item["commit"]))
+        or {"readiness": {"ready": True}},
+    )
+    monkeypatch.setattr(
+        release,
+        "database_command",
+        lambda *args: pytest.fail("pure frontend deployment touched the databases"),
+    )
+    receipt = release.deploy(directory, evidence, tmp_path)
+    assert receipt["status"] == "activating"
+    assert receipt["backupMode"] == "none" and receipt["backups"] == {}
+    assert events == [("stop", before["commit"])]
+    assert release.recover_pending(tmp_path, activate=True)["status"] == "deployed"
+    assert events == [("stop", before["commit"]), ("start", pointer["commit"])]
+    assert database_values(tmp_path) == ["original", "original"]
+    assert not (tmp_path / "runtime/deployments/pending.json").exists()
+
+
+def test_frontend_activation_failure_restores_old_pointer_without_database_copy(tmp_path, monkeypatch):
+    directory, pointer = snapshot_candidate(tmp_path)
+    before = legacy(tmp_path)
+    fixture_databases(tmp_path)
+    evidence = snapshot_proof(tmp_path, directory)
+    monkeypatch.setattr(release, "database_backup_required", lambda *args: False)
+    monkeypatch.setattr(release, "listener_pid", lambda: None)
+    monkeypatch.setattr(release, "stop", lambda *args: None)
+
+    def start(item, root, **kwargs):
+        if item["commit"] == pointer["commit"]:
+            raise RuntimeError("candidate did not become ready")
+        return {"readiness": {"ready": True}}
+
+    monkeypatch.setattr(release, "start", start)
+    release.deploy(directory, evidence, tmp_path)
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        release.recover_pending(tmp_path, activate=True)
+    assert release.read(tmp_path / "runtime/current.json") == before
+    assert database_values(tmp_path) == ["original", "original"]
+    assert not (tmp_path / "runtime/deployments/pending.json").exists()
+
+
+def test_frontend_crash_before_activation_restores_old_pointer(tmp_path, monkeypatch):
+    directory, _ = snapshot_candidate(tmp_path)
+    before = legacy(tmp_path)
+    fixture_databases(tmp_path)
+    evidence = snapshot_proof(tmp_path, directory)
+    monkeypatch.setattr(release, "database_backup_required", lambda *args: False)
+    monkeypatch.setattr(release, "listener_pid", lambda: None)
+    monkeypatch.setattr(release, "stop", lambda *args: None)
+    monkeypatch.setattr(release, "start", lambda *args, **kwargs: {"readiness": {"ready": True}})
+    receipt = release.deploy(directory, evidence, tmp_path)
+    receipt["status"] = "stopped"  # Crash after pointer write, before activation was recorded.
+    release.receipt_write(receipt)
+    assert release.recover_pending(tmp_path)["status"] == "rolled_back"
+    assert release.read(tmp_path / "runtime/current.json") == before
+    assert database_values(tmp_path) == ["original", "original"]
+
+
+@pytest.mark.parametrize("schema_change", [False, True])
+def test_backend_snapshot_backups_and_only_migrates_changed_schema(
+    tmp_path, monkeypatch, schema_change
+):
+    directory, pointer = snapshot_candidate(tmp_path)
+    before = legacy(tmp_path)
+    fixture_databases(tmp_path)
+    if not schema_change:
+        before["mainSchemaVersion"] = 36
+        release.write(tmp_path / "runtime/current.json", before)
+        with Database(tmp_path / "data/stock.db").transaction() as db:
+            db.execute("INSERT INTO schema_migrations VALUES(36)")
+    evidence = snapshot_proof(tmp_path, directory)
+    commands = []
+    monkeypatch.setattr(release, "database_backup_required", lambda *args: True)
+    monkeypatch.setattr(release, "listener_pid", lambda: None)
+    monkeypatch.setattr(release, "stop", lambda *args: None)
+
+    def database_command(item, root, command):
+        commands.append(command)
+        if schema_change:
+            return fixture_migrate(item, root, command)
+        return json.dumps({command: "ok"})
+
+    monkeypatch.setattr(release, "database_command", database_command)
+    monkeypatch.setattr(release, "start", lambda *args, **kwargs: {"readiness": {"ready": True}})
+    receipt = release.deploy(directory, evidence, tmp_path)
+    assert receipt["status"] == "activating"
+    assert receipt["backupMode"] == "full" and len(receipt["backups"]) == 2
+    assert commands == (["migrate", "verify"] if schema_change else ["verify"])
+    assert release.recover_pending(tmp_path, activate=True)["status"] == "deployed"
+
+
+def test_backend_snapshot_activation_failure_restores_both_databases(tmp_path, monkeypatch):
+    directory, pointer = snapshot_candidate(tmp_path)
+    before = legacy(tmp_path)
+    fixture_databases(tmp_path)
+    evidence = snapshot_proof(tmp_path, directory)
+    monkeypatch.setattr(release, "database_backup_required", lambda *args: True)
+    monkeypatch.setattr(release, "listener_pid", lambda: None)
+    monkeypatch.setattr(release, "stop", lambda *args: None)
+    monkeypatch.setattr(release, "database_command", fixture_migrate)
+
+    def start(item, root, **kwargs):
+        if item["commit"] == pointer["commit"]:
+            raise RuntimeError("candidate startup failed")
+        return {"readiness": {"ready": True}}
+
+    monkeypatch.setattr(release, "start", start)
+    release.deploy(directory, evidence, tmp_path)
+    assert database_values(tmp_path) == ["upgraded", "upgraded"]
+    with pytest.raises(RuntimeError, match="candidate startup failed"):
+        release.recover_pending(tmp_path, activate=True)
+    assert release.read(tmp_path / "runtime/current.json") == before
+    assert database_values(tmp_path) == ["original", "original"]
+    assert not (tmp_path / "runtime/deployments/pending.json").exists()
 
 
 def test_failed_upgrade_restores_both_databases_and_old_pointer(tmp_path, monkeypatch):
-    directory, pointer = candidate(tmp_path)
+    directory, pointer = snapshot_candidate(tmp_path)
     before = legacy(tmp_path)
-    proof_path = tmp_path / "proof.json"
-    proof(proof_path, pointer)
+    proof_path = snapshot_proof(tmp_path, directory)
     for name in ("stock.db", "minute.db"):
         with Database(tmp_path / "data" / name).transaction() as db:
             db.execute("CREATE TABLE records(value TEXT)")
@@ -150,6 +424,7 @@ def test_failed_upgrade_restores_both_databases_and_old_pointer(tmp_path, monkey
     )
     monkeypatch.setattr(release, "listening", lambda: False)
     monkeypatch.setattr(release, "listener_pid", lambda: None)
+    monkeypatch.setattr(release, "database_backup_required", lambda *args: True)
 
     def broken_migration(*args):
         with Database(tmp_path / "data/stock.db").transaction() as db:
@@ -219,15 +494,15 @@ def test_release_environment_ignores_regenerated_stale_python_cache(tmp_path):
     assert result.stdout.strip() == "new"
 
 
-def test_proof_checks_actual_evidence_and_rejects_path_escape(tmp_path):
-    _, pointer = candidate(tmp_path)
-    path = tmp_path / "proof.json"
-    value = proof(path, pointer)
-    (tmp_path / "offline-cold.txt").write_text("changed", encoding="utf-8")
+def test_snapshot_proof_checks_evidence_and_rejects_path_escape(tmp_path):
+    directory, pointer = snapshot_candidate(tmp_path)
+    path = snapshot_proof(tmp_path, directory)
+    value = release.read(path)
+    (tmp_path / "verification.log").write_text("changed", encoding="utf-8")
     with pytest.raises(ValueError, match="evidence hash"):
         release.validate_proof(path, pointer)
-    value = proof(path, pointer)
-    value["stages"]["offline-cold"]["evidencePath"] = "../outside.txt"
+    (tmp_path / "verification.log").write_text("domain verification passed", encoding="utf-8")
+    value["stages"]["domain"]["evidencePath"] = "../outside.txt"
     release.write(path, value)
     with pytest.raises(ValueError, match="outside"):
         release.validate_proof(path, pointer)
@@ -474,19 +749,20 @@ def database_values(root):
 
 
 def deployment_fixture(root, monkeypatch):
-    directory, pointer = candidate(root)
+    directory, pointer = snapshot_candidate(root)
     before = legacy(root)
     fixture_databases(root)
-    path = root / "proof.json"
-    proof(path, pointer)
+    path = snapshot_proof(root, directory)
     events = []
+    monkeypatch.setattr(release, "database_backup_required", lambda *args: True)
     monkeypatch.setattr(release, "listener_pid", lambda: None)
     monkeypatch.setattr(release, "stop", lambda item, *args: events.append(("stop", item["commit"])))
     monkeypatch.setattr(
         release,
         "start",
         lambda item, root, **kw: (
-            events.append(("start", item["commit"], kw.get("scheduler", True))) or {"ok": True}
+            events.append(("start", item["commit"], kw.get("scheduler", True)))
+            or {"readiness": {"ready": True}}
         ),
     )
     monkeypatch.setattr(release, "database_command", fixture_migrate)
@@ -499,60 +775,6 @@ def pending_receipt(root, receipt):
         root / "runtime/deployments/pending.json",
         {"receipt": str(Path(receipt["directory"]) / "receipt.json")},
     )
-
-
-def test_successful_deploy_migrates_once_and_starts_cold_before_hot(tmp_path, monkeypatch):
-    directory, pointer, before, path, events = deployment_fixture(tmp_path, monkeypatch)
-    receipt = release.deploy(directory, path, tmp_path)
-    assert receipt["status"] == "deployed"
-    assert release.read(tmp_path / "runtime/current.json")["commit"] == pointer["commit"]
-    assert database_values(tmp_path) == ["upgraded", "upgraded"]
-    assert events == [
-        ("stop", before["commit"]),
-        ("start", pointer["commit"], False),
-        ("stop", pointer["commit"]),
-        ("start", pointer["commit"], True),
-    ]
-    assert not (tmp_path / "runtime/deployments/pending.json").exists()
-    assert len(receipt["backups"]) == 2
-
-
-@pytest.mark.parametrize("failure_during_hot", [False, True])
-@pytest.mark.parametrize("bound", [False, True])
-def test_unready_candidate_cannot_block_dual_database_rollback(
-    tmp_path, monkeypatch, failure_during_hot, bound
-):
-    directory, pointer = candidate(tmp_path)
-    before = legacy(tmp_path)
-    fixture_databases(tmp_path)
-    path = tmp_path / "proof.json"
-    proof(path, pointer)
-    world = ProcessWorld(tmp_path, pointer, monkeypatch)
-    original_start, original_stop = release.start, release.stop
-    old_restarted = []
-
-    def start(item, root, *, scheduler=True):
-        if item["commit"] == before["commit"]:
-            assert not any(world.live.values())
-            assert database_values(root) == ["original", "original"]
-            old_restarted.append(item["binary"])
-            return {"ok": True}
-        world.ready = failure_during_hot and not scheduler
-        world.bound = bound or world.ready
-        return original_start(item, root, scheduler=scheduler)
-
-    monkeypatch.setattr(release, "start", start)
-    monkeypatch.setattr(
-        release,
-        "stop",
-        lambda item, root: None if item["commit"] == before["commit"] else original_stop(item, root),
-    )
-    monkeypatch.setattr(release, "database_command", fixture_migrate)
-    with pytest.raises(RuntimeError, match="did not become ready"):
-        release.deploy(directory, path, tmp_path)
-    assert old_restarted == [before["binary"]]
-    assert release.read(tmp_path / "runtime/current.json") == before
-    assert not (tmp_path / "runtime/deployments/pending.json").exists()
 
 
 @pytest.mark.parametrize("name", ["stock.db", "minute.db"])
