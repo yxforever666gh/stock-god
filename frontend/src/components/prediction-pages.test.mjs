@@ -8,7 +8,7 @@ const moduleURL = source => `data:text/javascript;base64,${Buffer.from(source).t
 const uiStub = moduleURL("export const NButton='button', NTag='tag', NText='text'; export const useMessage=()=>({error(){},warning(){},success(){}})")
 const childStub = moduleURL('export default {render(){return null}}')
 const dragStub = moduleURL(`import {ref} from ${JSON.stringify(import.meta.resolve('vue'))}; export const useDraggableDataTableColumns=columns=>({tableRef:ref(null),columnsRef:ref(columns)})`)
-const routerStub = moduleURL("export const useRoute=()=>({query:{},name:'prediction'}); export const useRouter=()=>({replace:async()=>{}})")
+const routerStub = moduleURL("export const useRoute=()=>({query:{},name:'prediction'}); export const useRouter=()=>({replace:async target=>{globalThis.__researchRouteReplacements?.push(target)}})")
 const renderer = createRenderer({
   createComment: text => ({text}), insert() {}, remove() {}, parentNode: () => null,
   nextSibling: () => null, createElement: tag => ({tag}), createText: text => ({text}),
@@ -111,38 +111,55 @@ test('prediction uses server ranks and execution states without selection roles 
   }
 })
 
-test('prediction keeps the five-minute account selector collapsed until clicked', async () => {
+test('prediction uses a four-column account panel and calendar for report dates', async () => {
   const source = await readFile(new URL('predictionIndex.vue', import.meta.url), 'utf8')
-  assert.match(source, /<n-dropdown v-else trigger="click"/)
+  assert.match(source, /<n-popover v-else v-model:show="slotPickerOpen"/)
   assert.match(source, /slotOptions/)
-  assert.match(source, /:render-label="renderSlotLabel"/)
-  assert.match(source, /:node-props="slotNodeProps"/)
-  assert.match(source, /prediction-slot-option-current/)
+  assert.match(source, /repeat\(4, minmax\(0, 1fr\)\)/)
+  assert.match(source, /repeat\(2, minmax\(0, 1fr\)\)/)
+  assert.match(source, /width: min\(720px, calc\(100vw - 48px\)\)/)
   assert.match(source, /当前选择/)
-  assert.match(source, /买入：等待报告/)
+  assert.match(source, /predictionSlotBuyLabel/)
   assert.doesNotMatch(source, /predictionSlotReportLabel|reportTagType|持仓：/)
   assert.doesNotMatch(source, /已完成|尚未完成/)
   assert.match(source, /选择五分钟区间/)
-  assert.match(source, /选择交易日/)
+  assert.match(source, /<n-date-picker/)
+  assert.match(source, /日历选择交易日/)
   assert.match(source, /最近5个交易日/)
   assert.match(source, /全部交易日/)
+  assert.doesNotMatch(source, /reportDayOptions|<n-dropdown/)
   assert.doesNotMatch(source, /<n-tab v-for="slot in PREDICTION_SLOTS"/)
 })
 
-test('prediction report selector defaults to five recorded days and accepts a single day', async () => {
+test('account panel closes on selection and report calendar permits only recorded dates', async () => {
   globalThis.__researchPageFixtures = {ListPredictionSlots: async () => []}
+  globalThis.__researchRouteReplacements = []
   const app = renderer.createApp(await pageComponent('predictionIndex.vue'))
   const vm = app.mount({})
   try {
     const state = vm.$.setupState
+    assert.equal(state.slotOptions.length, 24)
+    state.slotPickerOpen = true
+    state.updateSlot('10:05')
+    assert.equal(state.slotPickerOpen, false)
+    assert.equal(state.selectedSlot, '10:05')
+    assert.equal(globalThis.__researchRouteReplacements.at(-1).query.slot, '10:05')
     assert.equal(state.reportDay, 'recent5')
     state.updateReportDates(['2026-09-29', '2026-09-28'])
     state.updateReportDay('2026-09-29')
-    assert.equal(state.reportDayLabel, '2026-09-29')
-    assert.deepEqual(state.reportDayOptions.map(option => option.key), ['recent5', 'all', '2026-09-29', '2026-09-28'])
+    assert.equal(state.reportDateValue, '2026-09-29')
+    assert.equal(state.reportDateDisabled(new Date(2026, 8, 29).getTime()), false)
+    assert.equal(state.reportDateDisabled(new Date(2026, 8, 27).getTime()), true)
+    assert.equal(globalThis.__researchRouteReplacements.at(-1).query.reportDay, '2026-09-29')
+    state.updateReportDay('recent5')
+    assert.equal(state.reportDateValue, null)
+    state.updateReportDay('all')
+    assert.equal(state.reportDay, 'all')
+    assert.equal(state.validReportDay('2026-02-30'), false)
   } finally {
     app.unmount()
     delete globalThis.__researchPageFixtures
+    delete globalThis.__researchRouteReplacements
   }
 })
 

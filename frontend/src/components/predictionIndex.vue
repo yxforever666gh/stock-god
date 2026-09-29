@@ -1,5 +1,5 @@
 <script setup>
-import {computed, defineAsyncComponent, h, onMounted, ref, watch} from 'vue'
+import {computed, defineAsyncComponent, onMounted, ref, watch} from 'vue'
 import {useRoute, useRouter} from 'vue-router'
 import {PREDICTION_SLOTS, predictionSlotBuyLabel, validPredictionSlot} from '../utils/prediction-slots.js'
 import {usePolling} from '../composables/usePolling.js'
@@ -13,6 +13,7 @@ const tabs = [
 const route = useRoute()
 const router = useRouter()
 const selectedSlot = ref(validPredictionSlot(route.query.slot) ? String(route.query.slot) : '09:50')
+const slotPickerOpen = ref(false)
 const slotStates = ref([])
 async function refreshSlots() { try { slotStates.value = await ListPredictionSlots() || [] } catch { slotStates.value = [] } }
 const slotPolling = usePolling(refreshSlots, 15000, {shouldRun: () => nowTab.value !== 'AI分析报告'})
@@ -22,18 +23,6 @@ const slotOptions = computed(() => PREDICTION_SLOTS.map(slot => {
  const state = slotStates.value.find(item => item.slot === slot.value)
  return {key: slot.value, label: slot.label, summary: predictionSlotBuyLabel(state)}
 }))
-function renderSlotLabel(option) {
- const current = option.key === selectedSlot.value
- return h('div', {class: 'prediction-slot-option-label'}, [
-  h('span', {class: 'prediction-slot-option-title'}, String(option.label)),
-  current ? h('span', {class: 'prediction-slot-current-mark'}, '当前') : null,
-  h('span', {class: 'prediction-slot-option-summary'}, String(option.summary || '买入：等待报告')),
- ])
-}
-function slotNodeProps(option) {
- const current = option.key === selectedSlot.value
- return current ? {class: 'prediction-slot-option-current', 'aria-current': 'true'} : {'aria-current': 'false'}
-}
 function buyTagType(state) {
  switch (state?.buyStatus) {
   case 'bought_full': return 'success'
@@ -46,6 +35,7 @@ function buyTagType(state) {
 }
 function updateSlot(slot) {
  if (!validPredictionSlot(slot)) return
+ slotPickerOpen.value = false
  selectedSlot.value = slot
  if (route.query.slot !== slot) router.replace({name: 'prediction', query: {...route.query, slot}})
  void refreshSlots()
@@ -53,17 +43,25 @@ function updateSlot(slot) {
 watch(() => route.query.slot, slot => updateSlot(validPredictionSlot(slot) ? String(slot) : '09:50'))
 const nowTab = ref(tabs.some(tab => tab.name === route.query.name) ? String(route.query.name) : tabs[0].name)
 const visited = ref([nowTab.value])
-const validReportDay = value => ['recent5', 'all'].includes(value) || /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))
+function validReportDay(value) {
+  if (['recent5', 'all'].includes(value)) return true
+  const text = String(value || '')
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return false
+  const date = new Date(`${text}T00:00:00Z`)
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === text
+}
 const reportDay = ref(validReportDay(route.query.reportDay) ? String(route.query.reportDay) : 'recent5')
 const reportDates = ref([])
-const reportDayOptions = computed(() => [
-  {key: 'recent5', label: '最近5个交易日'},
-  {key: 'all', label: '全部交易日'},
-  ...reportDates.value.map(day => ({key: day, label: day})),
-])
-const reportDayLabel = computed(() => reportDayOptions.value.find(item => item.key === reportDay.value)?.label || reportDay.value)
+const reportDateSet = computed(() => new Set(reportDates.value))
+const reportDateValue = computed(() => reportDateSet.value.has(reportDay.value) ? reportDay.value : null)
 function updateReportDates(dates) {
-  reportDates.value = [...new Set((dates || []).filter(day => /^\d{4}-\d{2}-\d{2}$/.test(day)))].sort().reverse()
+  reportDates.value = [...new Set((dates || []).filter(day => validReportDay(day) && !['recent5', 'all'].includes(day)))].sort().reverse()
+  if (!['recent5', 'all'].includes(reportDay.value) && !reportDateSet.value.has(reportDay.value)) updateReportDay('recent5')
+}
+function reportDateDisabled(timestamp) {
+  const date = new Date(timestamp)
+  const day = [date.getFullYear(), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')].join('-')
+  return !reportDateSet.value.has(day)
 }
 function updateReportDay(day) {
   if (!validReportDay(day)) return
@@ -86,20 +84,34 @@ onMounted(() => slotPolling.start({immediate: true}))
 <template>
   <n-card>
     <div class="prediction-slot-toolbar">
-      <n-dropdown v-if="nowTab === 'AI分析报告'" trigger="click" :options="reportDayOptions" @select="updateReportDay">
-        <n-button secondary size="small" class="prediction-slot-current-button" aria-label="选择交易日">
-          <span class="prediction-slot-current-prefix">当前选择</span>
-          <strong>{{ reportDayLabel }}</strong>
-          <span class="prediction-slot-chevron" aria-hidden="true">⌄</span>
-        </n-button>
-      </n-dropdown>
-      <n-dropdown v-else trigger="click" :options="slotOptions" :render-label="renderSlotLabel" :node-props="slotNodeProps" @select="updateSlot">
-        <n-button secondary size="small" class="prediction-slot-current-button" aria-label="选择五分钟区间">
-          <span class="prediction-slot-current-prefix">当前选择</span>
-          <strong>{{ selectedSlotInfo.label }}</strong>
-          <span class="prediction-slot-chevron" aria-hidden="true">⌄</span>
-        </n-button>
-      </n-dropdown>
+      <template v-if="nowTab === 'AI分析报告'">
+        <n-button-group>
+          <n-button size="small" :type="reportDay === 'recent5' ? 'primary' : 'default'" @click="updateReportDay('recent5')">最近5个交易日</n-button>
+          <n-button size="small" :type="reportDay === 'all' ? 'primary' : 'default'" @click="updateReportDay('all')">全部交易日</n-button>
+        </n-button-group>
+        <n-date-picker :formatted-value="reportDateValue" type="date" value-format="yyyy-MM-dd" clearable
+          placeholder="日历选择交易日" aria-label="日历选择交易日" class="prediction-report-date"
+          :disabled="!reportDates.length" :is-date-disabled="reportDateDisabled"
+          @update:formatted-value="day => updateReportDay(day || 'recent5')"/>
+      </template>
+      <n-popover v-else v-model:show="slotPickerOpen" trigger="click" placement="bottom-start" :show-arrow="false">
+        <template #trigger>
+          <n-button secondary size="small" class="prediction-slot-current-button" aria-label="选择五分钟区间">
+            <span class="prediction-slot-current-prefix">当前选择</span>
+            <strong>{{ selectedSlotInfo.label }}</strong>
+            <span class="prediction-slot-chevron" aria-hidden="true">⌄</span>
+          </n-button>
+        </template>
+        <div class="prediction-slot-grid" role="group" aria-label="选择五分钟区间">
+          <n-button v-for="option in slotOptions" :key="option.key" size="small" secondary
+            class="prediction-slot-grid-item" :type="option.key === selectedSlot ? 'primary' : 'default'"
+            :aria-current="option.key === selectedSlot ? 'true' : undefined" @click="updateSlot(option.key)">
+            <span class="prediction-slot-option-title">{{ option.label }}</span>
+            <span v-if="option.key === selectedSlot" class="prediction-slot-current-mark">当前</span>
+            <span class="prediction-slot-option-summary">{{ option.summary }}</span>
+          </n-button>
+        </div>
+      </n-popover>
       <div v-if="nowTab !== 'AI分析报告'" class="prediction-slot-status" aria-live="polite">
         <n-tag size="small" :type="buyTagType(selectedSlotState)" bordered="false">{{ predictionSlotBuyLabel(selectedSlotState) }}</n-tag>
       </div>
@@ -153,17 +165,30 @@ onMounted(() => slotPolling.start({immediate: true}))
   line-height: 1;
 }
 
-:global(.prediction-slot-option-current .n-dropdown-option-body) {
-  background: linear-gradient(90deg, #e9f8ee, #f9fffb);
-  box-shadow: inset 3px 0 #18a058, 0 4px 12px rgba(24, 160, 88, .14);
-  font-weight: 700;
+.prediction-report-date {
+  width: 190px;
 }
 
-.prediction-slot-option-label {
+.prediction-slot-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  width: min(720px, calc(100vw - 48px));
+  max-height: min(400px, 65vh);
+  overflow-y: auto;
+}
+
+.prediction-slot-grid-item {
+  height: 54px;
+  padding: 4px 8px;
+}
+
+.prediction-slot-grid-item :deep(.n-button__content) {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 2px 8px;
-  min-width: 168px;
+  gap: 2px 6px;
+  width: 100%;
+  text-align: left;
 }
 
 .prediction-slot-option-title {
@@ -185,5 +210,11 @@ onMounted(() => slotPolling.start({immediate: true}))
   color: #7a7f87;
   font-size: 12px;
   font-weight: 400;
+}
+
+@media (max-width: 760px) {
+  .prediction-slot-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 </style>

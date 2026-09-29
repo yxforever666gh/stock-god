@@ -54,9 +54,9 @@ def test_cold_start_ready_static_and_all_24_accounts_without_network(app_config)
         assert web.get("/livez").json() == {"ok": True}
         ready = web.get("/readyz")
         assert ready.status_code == 200
-        assert ready.json()["appVersion"] == "6.0.5"
+        assert ready.json()["appVersion"] == "6.0.6"
         assert all(ready.json()["readiness"].values())
-        assert web.get("/api/v1/system/info").json()["version"] == "6.0.5"
+        assert web.get("/api/v1/system/info").json()["version"] == "6.0.6"
         assert "Stock God" in web.get("/prediction").text
         assert web.get("/assets/missing.js").status_code == 404
         assert len(web.get("/api/v1/prediction/slots").json()) == 24
