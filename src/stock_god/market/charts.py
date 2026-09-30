@@ -25,6 +25,7 @@ from .common import (
     timestamp,
 )
 from .news import array
+from .normalization import normalize_bar
 
 PERIODS = {
     "1m": 1,
@@ -38,6 +39,14 @@ PERIODS = {
     "quarter": 66,
     "year": 260,
 }
+
+
+def _chart_wire(rows):
+    """Keep the established chart contract while retaining missingness internally."""
+    return [
+        row | {"amount": 0.0, "amountStatus": "missing"} if row.get("amount") is None else row for row in rows
+    ]
+
 
 AKSHARE_SCRIPT = r"""
 import contextlib, json, math, sys
@@ -56,12 +65,15 @@ result = []
 for row in frame.to_dict("records"):
     item = {"time": str(row[columns["time"]])}
     for key in ("open", "high", "low", "close", "volume", "amount"):
-        value = row.get(columns[key], 0) if columns[key] else 0
+        value = row.get(columns[key]) if columns[key] else None
+        if value is None or value == "":
+            item[key] = None
+            continue
         try:
             value = float(value)
         except (ValueError, TypeError):
-            value = 0
-        item[key] = value if math.isfinite(value) else 0
+            value = None
+        item[key] = value if value is not None and math.isfinite(value) else None
     result.append(item)
 json.dump(result, sys.stdout, ensure_ascii=False, allow_nan=False)
 """
@@ -143,9 +155,19 @@ def aggregate(rows, period):
                 low=min(result["low"], row["low"]),
                 close=row["close"],
                 volume=result["volume"] + row["volume"],
-                amount=result["amount"] + row["amount"],
+                amount=(
+                    result["amount"] + row["amount"]
+                    if result["amount"] is not None and row["amount"] is not None
+                    else None
+                ),
             )
-    return list(groups.values())
+    result = list(groups.values())
+    for row in result:
+        if row.get("amount") is None:
+            row["amountStatus"] = "missing"
+            if isinstance(row.get("fieldStatus"), dict):
+                row["fieldStatus"]["amount"] = "missing"
+    return result
 
 
 class Charts(ProviderState):
@@ -206,7 +228,8 @@ class Charts(ProviderState):
                         cap = min(cap, float(self.settings.get("privateMinuteTimeoutSec") or 60))
                     try:
                         fetched = [
-                            bar for bar in load(min(deadline, time.monotonic() + cap))
+                            bar
+                            for bar in load(min(deadline, time.monotonic() + cap))
                             if proves_unadjusted(bar.get("source"))
                         ]
                         if not fetched:
@@ -221,7 +244,9 @@ class Charts(ProviderState):
                             (bar for at, bar in by_time.items() if at.date() == day.date()),
                             key=lambda bar: timestamp(bar["time"]),
                         )
-                        if self._chart_window_covered(day_rows, window_start, window_end, day.date() == today):
+                        if self._chart_window_covered(
+                            day_rows, window_start, window_end, day.date() == today
+                        ):
                             break
                     except (MarketDataError, ValueError, KeyError, TypeError) as exc:
                         errors.append({"provider": name, "message": date + ": " + str(exc)})
@@ -233,9 +258,11 @@ class Charts(ProviderState):
             except (MarketDataError, ValueError) as exc:
                 errors.append({"provider": "quote", "message": str(exc)})
         if time.monotonic() >= deadline:
-            errors.append({"provider": "chart", "message": "refresh time budget exhausted; verified cache retained"})
+            errors.append(
+                {"provider": "chart", "message": "refresh time budget exhausted; verified cache retained"}
+            )
         return {
-            "bars": [by_time[at] for at in sorted(by_time)],
+            "bars": _chart_wire([by_time[at] for at in sorted(by_time)]),
             "quote": quote,
             "openedDates": opened_dates,
             "errors": errors,
@@ -245,7 +272,8 @@ class Charts(ProviderState):
     def _chart_window_covered(rows, start, end, current_day):
         target = (
             end.replace(second=0, microsecond=0) - timedelta(minutes=1)
-            if current_day else end - timedelta(minutes=5)
+            if current_day
+            else end - timedelta(minutes=5)
         )
         if 690 <= target.hour * 60 + target.minute < 780:
             target = target.replace(hour=11, minute=29)
@@ -285,8 +313,8 @@ class Charts(ProviderState):
                 {
                     "time": fields[0][:2] + ":" + fields[0][2:4],
                     "price": number(fields[1]),
-                    "volume": number(fields[2]),
-                    "amount": number(fields[3]) if len(fields) > 3 else 0,
+                    "volume": number(fields[2]) * 100 if number(fields[2]) is not None else None,
+                    "amount": number(fields[3]) if len(fields) > 3 else None,
                 }
             )
         return {"priceData": rows, "date": payload["date"], "stockName": name, "stockCode": code}
@@ -303,7 +331,9 @@ class Charts(ProviderState):
         unit = "m1" if minute else "day"
         count = min(1200 if minute else 12000, limit * PERIODS[period])
         params = {"param": f"{code},{unit},,,{count}" + ("" if minute else f",{adjustment}")}
-        response = self.http.json(url, params, headers={"Referer": "https://gu.qq.com/"}, timeout=remaining_seconds(deadline))
+        response = self.http.json(
+            url, params, headers={"Referer": "https://gu.qq.com/"}, timeout=remaining_seconds(deadline)
+        )
         if response.get("code", 0) != 0:
             raise MarketDataError("Tencent bar source rejected request")
         payload = response.get("data", {}).get(code, {})
@@ -322,14 +352,17 @@ class Charts(ProviderState):
                 {
                     "time": at.isoformat(),
                     **{
-                        field: number(row[index], 0)
+                        field: number(row[index], None if field in ("volume", "amount") else 0)
                         for field, index in {"open": 1, "close": 2, "high": 3, "low": 4, "volume": 5}.items()
                     },
-                    "amount": 0.0,
+                    "amount": None,
                     "source": "tencent:" + ("none" if minute else adjustment),
                 }
             )
-        return valid_bars(result, start, end)
+        return [
+            normalize_bar(row, source=row["source"], volume_unit="lots", amount_unit="CNY")
+            for row in valid_bars(result, start, end)
+        ]
 
     def _eastmoney_bars(self, code, start, end, period, adjustment, limit):
         minute = period.endswith("m")
@@ -355,7 +388,7 @@ class Charts(ProviderState):
                 {
                     "time": timestamp(row[0]).isoformat(),
                     **{
-                        field: number(row[index], 0)
+                        field: number(row[index], None if field in ("volume", "amount") else 0)
                         for field, index in {
                             "open": 1,
                             "close": 2,
@@ -368,7 +401,10 @@ class Charts(ProviderState):
                     "source": "eastmoney:" + adjustment,
                 }
             )
-        return valid_bars(result, start, end)
+        return [
+            normalize_bar(row, source=row["source"], volume_unit="lots", amount_unit="CNY")
+            for row in valid_bars(result, start, end)
+        ]
 
     def _sina_bars(self, code, start, end, period, adjustment, limit, deadline=None):
         if adjustment != "none":
@@ -389,14 +425,24 @@ class Charts(ProviderState):
             {
                 "time": timestamp(row["day"]).isoformat(),
                 **{
-                    key: number(row.get(key), 0)
+                    key: number(row.get(key), None if key in ("volume", "amount") else 0)
                     for key in ("open", "high", "low", "close", "volume", "amount")
                 },
                 "source": "sina:none",
             }
             for row in rows
         ]
-        return valid_bars(result, start, end)
+        return [
+            normalize_bar(
+                row,
+                source=row["source"],
+                volume_unit="lots"
+                if str(row["source"]).lower().startswith(("tencent", "eastmoney"))
+                else "shares",
+                amount_unit="CNY",
+            )
+            for row in valid_bars(result, start, end)
+        ]
 
     def _cached_minute_bars(self, code, start, end):
         symbol = code[2:] + "." + code[:2].upper()
@@ -418,13 +464,19 @@ class Charts(ProviderState):
         result = [
             {
                 "time": timestamp(row["trade_time"]).isoformat(),
-                **{key: float(row[key] or 0) for key in ("open", "high", "low", "close", "volume", "amount")},
+                **{
+                    key: (float(row[key]) if row[key] is not None else None)
+                    for key in ("open", "high", "low", "close", "volume", "amount")
+                },
                 "source": row["source"],
             }
             for row in rows
             if proves_unadjusted(row.get("source"))
         ]
-        return valid_bars(result, start, end)
+        return [
+            normalize_bar(row, source=row["source"], volume_unit="shares", amount_unit="CNY")
+            for row in valid_bars(result, start, end)
+        ]
 
     def _akshare_bars(self, code, start, end, deadline=None):
         preference = self.settings.get("akshareMinuteSourceMode") or "auto"
@@ -469,7 +521,10 @@ class Charts(ProviderState):
                 if timestamp(rows[0]["time"]) <= start + timedelta(minutes=1) and timestamp(
                     rows[-1]["time"]
                 ) >= end - timedelta(minutes=1):
-                    return rows
+                    return [
+                        normalize_bar(row, source=label, volume_unit="shares", amount_unit="CNY")
+                        for row in rows
+                    ]
             except (subprocess.TimeoutExpired, OSError, ValueError, MarketDataError) as exc:
                 failures.append(
                     type(exc).__name__ + ": " + str(exc)[:200]
@@ -477,7 +532,10 @@ class Charts(ProviderState):
                     else type(exc).__name__
                 )
         if partial:
-            return partial
+            return [
+                normalize_bar(row, source=row["source"], volume_unit="shares", amount_unit="CNY")
+                for row in partial
+            ]
         raise MarketDataError("AKShare minute sources failed: " + "; ".join(failures))
 
     def _public_minute_sources(self, code, start, end, limit):
@@ -500,9 +558,13 @@ class Charts(ProviderState):
         if self.settings.get("tencentMinuteEnabled", True) and (
             end.date() == today.date() or timedelta(0) <= today - end <= timedelta(days=7)
         ):
-            available["tencent"] = lambda deadline=None: self._tencent_bars(code, start, end, "1m", "none", limit, deadline)
+            available["tencent"] = lambda deadline=None: self._tencent_bars(
+                code, start, end, "1m", "none", limit, deadline
+            )
         if self.settings.get("sinaMinuteEnabled", True) and end.date() == today.date():
-            available["sina"] = lambda deadline=None: self._sina_bars(code, start, end, "1m", "none", limit, deadline)
+            available["sina"] = lambda deadline=None: self._sina_bars(
+                code, start, end, "1m", "none", limit, deadline
+            )
         if self.settings.get("akshareEnabled", True):
             available["akshare"] = lambda deadline=None: self._akshare_bars(code, start, end, deadline)
         if (
@@ -547,7 +609,10 @@ class Charts(ProviderState):
                     "source": "eastmoney:none",
                 }
             )
-        return valid_bars(result, start, end)
+        return [
+            normalize_bar(row, source=row["source"], volume_unit="lots", amount_unit="CNY")
+            for row in valid_bars(result, start, end)
+        ]
 
     def _prediction_minutes(self, code, start, end, usable):
         failures = []
@@ -636,14 +701,18 @@ class Charts(ProviderState):
                     {
                         "time": timestamp(row["trade_time"]).isoformat(),
                         **{
-                            key: number(row.get(key), 0) for key in ("open", "high", "low", "close", "amount")
+                            key: number(row.get(key), None)
+                            for key in ("open", "high", "low", "close", "amount")
                         },
-                        "volume": float(number(row.get("vol"), 0)) * 100,
+                        "volume": number(row.get("vol"), None),
                         "source": "private-minute:none",
                     }
                 )
             if len(result) >= int(data.get("total", len(result))) or len(items) < page_size:
-                return valid_bars(result, start, end)
+                return [
+                    normalize_bar(row, source=row["source"], volume_unit="lots", amount_unit="unknown")
+                    for row in valid_bars(result, start, end)
+                ]
             interval = float(self.settings.get("privateMinuteMinIntervalMs") or 0) / 1000
             if interval > 0:
                 time.sleep(interval)
@@ -768,7 +837,7 @@ class Charts(ProviderState):
         )
         bar = next(row for row in bars if timestamp(row["time"]).replace(second=0, microsecond=0) == target)
         price = bar["close"]
-        if bar["amount"] > 0 and bar["volume"] > 0:
+        if bar.get("amount") is not None and bar.get("amount", 0) > 0 and bar.get("volume", 0) > 0:
             value = bar["amount"] / bar["volume"]
             if bar["low"] * 0.8 < value < bar["high"] * 1.2:
                 price = value
@@ -880,7 +949,7 @@ class Charts(ProviderState):
         }
         try:
             rows, source, errors = self._bars_with_source(code, start, end, period, adjustment, limit)
-            data["bars"] = rows
+            data["bars"] = _chart_wire(rows)
             return envelope(
                 data, source, as_of=rows[-1]["time"], errors=errors, status="partial" if errors else "ok"
             )

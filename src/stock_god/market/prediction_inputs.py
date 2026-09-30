@@ -26,7 +26,9 @@ def metrics(bars, quote):
             "dayDistanceFromHighPct",
         )
     }
-    result.update(windowVolume=0.0, windowAmount=0.0, historicalBaseline="unavailable")
+    result.update(
+        windowVolume=0.0, windowAmount=None, amountStatus="missing", historicalBaseline="unavailable"
+    )
     if quote.get("preClose"):
         result["dayReturnPct"] = (quote["price"] / quote["preClose"] - 1) * 100
     if quote.get("preClose") and quote.get("open"):
@@ -36,12 +38,19 @@ def metrics(bars, quote):
     if not bars:
         return result
     result["returnPct"] = (bars[-1]["close"] / bars[0]["open"] - 1) * 100
-    result["windowVolume"] = sum(bar["volume"] for bar in bars)
-    result["windowAmount"] = sum(bar["amount"] for bar in bars)
-    if result["windowVolume"] > 0:
-        value = result["windowAmount"] / result["windowVolume"]
+    volumes = [bar.get("volume") for bar in bars]
+    result["windowVolume"] = (
+        sum(volumes) if all(isinstance(value, (int, float)) for value in volumes) else None
+    )
+    amounts = [
+        bar.get("amount") for bar in bars if isinstance(bar.get("amount"), (int, float)) and bar["amount"] > 0
+    ]
+    result["windowAmount"] = sum(amounts) if amounts else None
+    result["amountStatus"] = "observed" if len(amounts) == len(bars) else "missing"
+    if result["windowVolume"] is not None and result["windowVolume"] > 0:
+        value = result["windowAmount"] / result["windowVolume"] if result["windowAmount"] is not None else 0
         low, high = min(bar["low"] for bar in bars), max(bar["high"] for bar in bars)
-        if low * 0.8 <= value <= high * 1.2:
+        if result["amountStatus"] == "observed" and low * 0.8 <= value <= high * 1.2:
             result["vwap"], result["vwapMethod"] = value, "amount_divided_by_share_volume"
         elif low * 0.8 <= value / 100 <= high * 1.2:
             result["vwap"], result["vwapMethod"] = value / 100, "amount_divided_by_lot_volume_times_100"
@@ -61,8 +70,10 @@ def metrics(bars, quote):
     if peak > trough:
         result["recoveryPct"] = (bars[-1]["close"] - trough) / (peak - trough) * 100
     middle = len(bars) // 2
-    first = sum(bar["volume"] for bar in bars[:middle])
-    second = sum(bar["volume"] for bar in bars[middle:])
+    first_values = [bar.get("volume") for bar in bars[:middle]]
+    second_values = [bar.get("volume") for bar in bars[middle:]]
+    first = sum(first_values) if all(isinstance(value, (int, float)) for value in first_values) else 0
+    second = sum(second_values) if all(isinstance(value, (int, float)) for value in second_values) else 0
     if first:
         result["volumeAcceleration"] = (second / max(1, len(bars) - middle)) / (first / max(1, middle))
     return {key: round(value, 4) if isinstance(value, float) else value for key, value in result.items()}
@@ -372,8 +383,9 @@ class PredictionInputs(ProviderState):
                 "previousClose": row["preClose"],
                 "high": row["high"],
                 "low": row["low"],
-                "turnoverPct": row.get("turnover"),
-                "mainFlow": row.get("mainFlow"),
+                "turnoverPct": row.get("turnoverPct", row.get("turnover")),
+                "mainFlowCny": row.get("mainFlowCny", row.get("mainFlow")),
+                "mainFlow": row.get("mainFlowCny", row.get("mainFlow")),
                 "dayVolume": row["volume"],
                 "dayAmount": row["amount"],
             }
@@ -543,9 +555,7 @@ class PredictionInputs(ProviderState):
             try:
                 raw = call()
                 completed_at = now()
-                filtered, available, keep = normalize_auxiliary(
-                    raw, cutoff, completed_at, source=key
-                )
+                filtered, available, keep = normalize_auxiliary(raw, cutoff, completed_at, source=key)
                 error = "source has no cutoff-safe items" if not keep else ""
                 result = document("research2:aux:" + key, category, filtered, available, error, code, label)
                 if not _has_observation_time(raw):

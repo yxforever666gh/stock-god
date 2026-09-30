@@ -21,6 +21,7 @@ from .common import (
     remaining_seconds,
     timestamp,
 )
+from .normalization import normalize_quote
 
 
 def parse_tencent(text: str) -> list[dict]:
@@ -58,7 +59,12 @@ def parse_tencent(text: str) -> list[dict]:
             composite = parts[35].split("/")
             if len(composite) != 3 or number(composite[1]) is None or number(composite[2]) is None:
                 raise MarketDataError("Tencent turnover fields are invalid")
-            quote.update(volume=float(composite[1]) * 100, amount=float(composite[2]))
+            quote.update(
+                volume=float(composite[1]),
+                amount=float(composite[2]),
+                turnoverPct=number(parts[38]) if len(parts) > 38 else None,
+                mainFlowCny=None,
+            )
             for level in range(5):
                 quote[f"bid{level + 1}"] = number(parts[9 + level * 2])
                 quote[f"bidVolume{level + 1}"] = number(parts[10 + level * 2])
@@ -67,7 +73,7 @@ def parse_tencent(text: str) -> list[dict]:
         quote["changePct"] = (quote["price"] / quote["preClose"] - 1) * 100 if quote["preClose"] else None
         if any(quote.get(key) is None or quote[key] < 0 for key in ("volume", "amount")):
             raise MarketDataError("Tencent turnover is invalid")
-        quotes.append(quote)
+        quotes.append(normalize_quote(quote, source="quote:tencent", volume_unit="lots"))
     if not quotes:
         raise MarketDataError("Tencent returned no valid quotes")
     return quotes
@@ -122,7 +128,14 @@ def parse_sina(text: str) -> list[dict]:
         }
         if quote["price"] is None or quote["preClose"] is None:
             raise MarketDataError("Sina returned invalid quote prices")
-        quote.update(code=code, asOf=at.astimezone(CN).isoformat(), source="sina", status="ok")
+        quote.update(
+            code=code,
+            asOf=at.astimezone(CN).isoformat(),
+            source="sina",
+            status="ok",
+            turnoverPct=None,
+            mainFlowCny=None,
+        )
         quote["changePct"] = (quote["price"] / quote["preClose"] - 1) * 100 if quote["preClose"] else None
         if code.startswith(("sh", "sz", "bj")):
             for level in range(5):
@@ -130,7 +143,7 @@ def parse_sina(text: str) -> list[dict]:
                 quote[f"bid{level + 1}"] = number(values[11 + level * 2])
                 quote[f"askVolume{level + 1}"] = number(values[20 + level * 2])
                 quote[f"ask{level + 1}"] = number(values[21 + level * 2])
-        quotes.append(quote)
+        quotes.append(normalize_quote(quote, source="quote:sina", volume_unit="shares"))
     if not quotes:
         raise MarketDataError("Sina returned no valid quotes")
     return quotes
@@ -151,7 +164,14 @@ class Quotes(ProviderState):
             for offset in range(0, len(missing), 80):
                 chunk = missing[offset : offset + 80]
                 try:
-                    rows = parser(self.http.text(url, {parameter: ",".join(chunk)}, encoding="gb18030", timeout=remaining_seconds(deadline)))
+                    rows = parser(
+                        self.http.text(
+                            url,
+                            {parameter: ",".join(chunk)},
+                            encoding="gb18030",
+                            timeout=remaining_seconds(deadline),
+                        )
+                    )
                     for quote in rows:
                         if quote["code"] in chunk:
                             found[quote["code"]] = quote
@@ -164,7 +184,9 @@ class Quotes(ProviderState):
 
     def quote(self, code: str, *, deadline=None) -> dict:
         normalized = instrument(code)["code"]
-        value = self.http.cached("quote:" + normalized, 2, lambda: self.quotes([normalized], deadline=deadline)[0])
+        value = self.http.cached(
+            "quote:" + normalized, 2, lambda: self.quotes([normalized], deadline=deadline)[0]
+        )
         rate = 0.3 if normalized.startswith("bj") else 0.2 if normalized.startswith(("sh68", "sz30")) else 0.1
         if "ST" in value["name"].upper():
             rate = 0.05
@@ -249,7 +271,10 @@ class Quotes(ProviderState):
             if data.get("has_more") or not required <= set(fields):
                 raise MarketDataError("partial stock master or missing fields")
             rows = [
-                {key: str(value).strip() if value is not None else "" for key, value in zip(fields, row, strict=False)}
+                {
+                    key: str(value).strip() if value is not None else ""
+                    for key, value in zip(fields, row, strict=False)
+                }
                 for row in data.get("items", [])
             ]
             if len(rows) < 5000 or len({row.get("ts_code") for row in rows}) != len(rows):
@@ -502,27 +527,31 @@ class Quotes(ProviderState):
             for row in rows:
                 code = str(row["f12"])
                 mapped.append(
-                    {
-                        "code": instrument(code)["code"],
-                        "name": row.get("f14", ""),
-                        **{
-                            key: number(row.get(field))
-                            for key, field in {
-                                "price": "f2",
-                                "changePct": "f3",
-                                "volume": "f5",
-                                "amount": "f6",
-                                "turnover": "f8",
-                                "high": "f15",
-                                "low": "f16",
-                                "open": "f17",
-                                "preClose": "f18",
-                                "mainFlow": "f62",
-                            }.items()
+                    normalize_quote(
+                        {
+                            "code": instrument(code)["code"],
+                            "name": row.get("f14", ""),
+                            **{
+                                key: number(row.get(field))
+                                for key, field in {
+                                    "price": "f2",
+                                    "changePct": "f3",
+                                    "volume": "f5",
+                                    "amount": "f6",
+                                    "turnoverPct": "f8",
+                                    "high": "f15",
+                                    "low": "f16",
+                                    "open": "f17",
+                                    "preClose": "f18",
+                                    "mainFlowCny": "f62",
+                                }.items()
+                            },
+                            "listingDate": str(int(number(row.get("f26"), 0))),
+                            "asOf": timestamp(row["f124"]).isoformat() if number(row.get("f124")) else None,
                         },
-                        "listingDate": str(int(number(row.get("f26"), 0))),
-                        "asOf": timestamp(row["f124"]).isoformat() if number(row.get("f124")) else None,
-                    }
+                        source="quote:eastmoney",
+                        volume_unit="lots",
+                    )
                 )
             unique = {row["code"]: row for row in mapped}
             if len(unique) / total < 0.95:
@@ -551,6 +580,9 @@ class Quotes(ProviderState):
         metadata = {instrument(row["ts_code"])["code"]: row for row in master}
         for row in rows:
             row["listingDate"] = metadata[row["code"]].get("list_date", "")
-            row.setdefault("turnover", None)
-            row.setdefault("mainFlow", None)
+            if "fieldStatus" not in row:
+                row.update(normalize_quote(row, source="quote:fallback", volume_unit="shares"))
+            row.setdefault("turnoverPct", row.get("turnover"))
+            row.setdefault("turnover", row.get("turnoverPct"))
+            row.setdefault("mainFlowCny", row.get("mainFlow"))
         return {"rows": rows, "reported": len(codes), "source": "tencent+sina", "errors": errors}

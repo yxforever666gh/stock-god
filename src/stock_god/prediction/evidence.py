@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import PredictionError, code, json_text, local, lot_size, parse_time, positive, stamp, trade_cost
+from .input_facts import compact_snapshot, model_score_evidence
 
 PROMPT = (Path(__file__).parent / "prompts" / "overnight_strength.md").read_text(encoding="utf-8")
 
@@ -307,6 +308,7 @@ def prepare(evidence, market):
         for c in evidence.get("candidates", [])
         if normalized(c["code"])
     }
+    evidence["prompt"] = compact_snapshot(evidence)
     return evidence
 
 
@@ -334,7 +336,7 @@ def build_prompt(evidence):
             "\n# 系统注入的紧凑结构化证据",
             str(evidence.get("prompt") or "").strip(),
             "\n# 本轮候选评分依据（按规范化股票代码索引）",
-            json_text(evidence.get("scoreEvidence", {})),
+            json_text(model_score_evidence(evidence.get("scoreEvidence", {}))),
             "\n# 输出约束",
             "逐只覆盖冻结候选，包含低分股票；只能引用本轮适用的sourceId。市场20、板块30、个股40、催化10、风险扣分25。",
             (
