@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from stock_god import APP_VERSION
 from stock_god.app import create_app
 from stock_god.cli import process_lock
 from stock_god.prediction.core import local
@@ -54,9 +55,9 @@ def test_cold_start_ready_static_and_all_24_accounts_without_network(app_config)
         assert web.get("/livez").json() == {"ok": True}
         ready = web.get("/readyz")
         assert ready.status_code == 200
-        assert ready.json()["appVersion"] == "6.0.7"
+        assert ready.json()["appVersion"] == APP_VERSION
         assert all(ready.json()["readiness"].values())
-        assert web.get("/api/v1/system/info").json()["version"] == "6.0.7"
+        assert web.get("/api/v1/system/info").json()["version"] == APP_VERSION
         assert "Stock God" in web.get("/prediction").text
         assert web.get("/assets/missing.js").status_code == 404
         assert len(web.get("/api/v1/prediction/slots").json()) == 24

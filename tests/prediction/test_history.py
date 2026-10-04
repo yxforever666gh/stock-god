@@ -7,6 +7,7 @@ from stock_god.prediction.core import local, stamp
 from stock_god.prediction.history import classify_outcome
 from stock_god.prediction.replay import AllocationReplay, plan_hash
 from stock_god.prediction.repository import insert
+from stock_god.prediction.views import Views
 
 
 def bar(at, price=10, high=None):
@@ -31,6 +32,62 @@ def complete_day(at, price=10):
             continue
         rows.append(bar(current, price))
     return {"previousClose": 10.0, "limitRate": 0.1, "bars": rows, "sourceStatusJson": "[]"}
+
+
+class PortfolioLedger:
+    def __init__(self, trades, now="2026-10-05T15:05:00+08:00"):
+        self.trades = trades
+        self.now = local(now)
+
+    def clock(self):
+        return self.now
+
+    def rows(self, table, where="", params=(), order=""):
+        if table == "trades":
+            return self.trades
+        return []
+
+
+def trade(identity, side, at, quantity=100, slot="09:50", id=1):
+    return {
+        "id": id,
+        "recommendation_id": identity,
+        "side": side,
+        "traded_at": stamp(local(at)),
+        "quantity": quantity,
+        "slot": slot,
+    }
+
+
+def test_trading_day_count_uses_trade_intervals_and_calendar_boundaries():
+    trades = [
+        trade("first", "buy", "2026-09-24T09:50:00+08:00", id=1),
+        trade("first", "buy", "2026-09-24T09:51:00+08:00", id=2),
+        trade("first", "sell", "2026-09-28T14:50:00+08:00", quantity=200, id=3),
+        trade("second", "buy", "2026-09-25T09:50:00+08:00", id=4),
+        trade("second", "sell", "2026-09-29T14:50:00+08:00", id=5),
+    ]
+    days = Views(PortfolioLedger(trades), lambda day: day.weekday() < 5)
+    assert days.trading_day_count("09:50") == 4
+    assert days.trading_day_count("09:50", "2026-09-25", "2026-09-28") == 2
+
+
+def test_trading_day_count_handles_open_positions_holidays_and_calendar_failure():
+    trades = [trade("open", "buy", "2026-09-30T09:50:00+08:00")]
+    holiday = {"2026-10-01"}
+    days = Views(PortfolioLedger(trades), lambda day: day.weekday() < 5 and day.date().isoformat() not in holiday)
+    assert days.trading_day_count("09:50") == 3
+    assert Views(PortfolioLedger([]), lambda day: True).trading_day_count("09:50") == 0
+
+    def unavailable(_):
+        raise RuntimeError("calendar unavailable")
+
+    assert Views(PortfolioLedger(trades), unavailable).trading_day_count("09:50") is None
+
+
+def test_integrated_portfolio_does_not_report_a_combined_trading_day_count():
+    result = Views(PortfolioLedger([]), lambda day: True).portfolio(["09:50", "10:00"])
+    assert result["tradingDayCount"] is None
 
 
 def test_outcome_uses_only_complete_minutes_after_buy_and_requires_coverage():

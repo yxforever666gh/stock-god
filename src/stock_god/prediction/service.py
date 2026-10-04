@@ -52,7 +52,7 @@ class PredictionService:
         )
         self.clock = clock or local
         self.repo = Repository(database, self.clock)
-        self.views = Views(self.repo)
+        self.views = Views(self.repo, lambda day: self.market.is_trading_day(day))
         self.email = EmailService(self.repo, settings, mailer)
         self._trade_lock = asyncio.Lock()
         self._metric_lock = asyncio.Lock()
@@ -631,7 +631,8 @@ class PredictionService:
         return self.views.performance(slot)
 
     def portfolio_performance(self, *args, **kwargs):
-        return self.views.portfolio(*args, **kwargs)
+        with self._provider(self._snapshot().config) as market:
+            return Views(self.repo, market.is_trading_day).portfolio(*args, **kwargs)
 
     def slots(self, now=None):
         return self.views.slots(now)

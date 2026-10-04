@@ -2511,8 +2511,8 @@ components:
     PredictionPortfolioPerformance:
       type: object
       required: [slots, selectedAccountCount, effectiveAccountCount, incompleteAccountCount, noActivityAccountCount,
-        boughtTrades, closedTrades, winningTrades, classifiedTrades, pendingOutcomeCount, sealed, broken, untouched,
-        curve]
+        tradingDayCount, boughtTrades, closedTrades, winningTrades, classifiedTrades, pendingOutcomeCount, sealed,
+        broken, untouched, curve]
       properties:
         slots:
           type: array
@@ -2524,6 +2524,7 @@ components:
         incompleteAccountCount: {type: integer}
         noActivityAccountCount: {type: integer}
         periodReturn: {type: number, nullable: true}
+        tradingDayCount: {type: integer, format: int64, nullable: true}
         boughtTrades: {type: integer, format: int64}
         closedTrades: {type: integer, format: int64}
         winningTrades: {type: integer, format: int64}

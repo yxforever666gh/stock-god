@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from .core import DEFAULT_SLOT, SLOTS, PredictionError, dto, local, stamp, valid_slot
@@ -46,9 +46,65 @@ def portfolio_query(slots=None, from_date="", to_date=""):
     return selected, from_date, to_date
 
 
+def _holding_intervals(trades, today):
+    grouped = {}
+    for row in trades:
+        grouped.setdefault(row["recommendation_id"], []).append(row)
+    intervals = []
+    for identity, events in grouped.items():
+        quantity = 0
+        opened = None
+        for event in sorted(events, key=lambda row: (local(row["traded_at"]), row.get("id", 0))):
+            day = local(event["traded_at"]).date()
+            units = max(1, int(event.get("quantity") or 0))
+            if event["side"] == "buy":
+                if quantity <= 0:
+                    opened = day
+                quantity += units
+            elif event["side"] == "sell":
+                if quantity <= 0:
+                    intervals.append((day, day))
+                    continue
+                quantity = max(0, quantity - units)
+                if quantity == 0:
+                    intervals.append((opened or day, day))
+                    opened = None
+        if quantity > 0 and opened:
+            intervals.append((opened, today))
+
+    return intervals
+
+
 class Views:
-    def __init__(self, repository):
-        self.repo = repository
+    def __init__(self, repository, is_trading_day=None):
+        self.repo, self.is_trading_day = repository, is_trading_day
+
+    def trading_day_count(self, slot, from_date="", to_date=""):
+        today = local(self.repo.clock()).date()
+        lower = date.fromisoformat(from_date) if from_date else date.min
+        upper = min(date.fromisoformat(to_date) if to_date else today, today)
+        if lower > upper:
+            return 0
+
+        trades = self.repo.rows("trades", "slot=?", (slot,), "julianday(traded_at),id")
+        dates = set()
+        for start, end in _holding_intervals(trades, today):
+            start, end = max(start, lower), min(end, upper)
+            while start <= end:
+                dates.add(start)
+                start += timedelta(days=1)
+        if not dates:
+            return 0
+        if not callable(self.is_trading_day):
+            return None
+        count = 0
+        for day in sorted(dates):
+            try:
+                if self.is_trading_day(local(day.isoformat())):
+                    count += 1
+            except (AttributeError, OSError, RuntimeError, ValueError):
+                return None
+        return count
 
     def run(self, identity):
         row = self.repo.row("analysis_runs", "run_id=?", (identity,))
@@ -275,6 +331,7 @@ class Views:
             incompleteAccountCount=0,
             noActivityAccountCount=0,
             periodReturn=None,
+            tradingDayCount=None,
             boughtTrades=0,
             closedTrades=0,
             winningTrades=0,
@@ -292,6 +349,8 @@ class Views:
             and (not to_date or local(r["buy_at"]).date().isoformat() <= to_date)
         ]
         result["boughtTrades"] = len(selected)
+        if len(slots) == 1:
+            result["tradingDayCount"] = self.trading_day_count(slots[0], from_date, to_date)
         closed = [r for r in selected if r["status"] == "closed"]
         result["closedTrades"] = len(closed)
         result["winningTrades"] = sum((r["net_pn_l"] or 0) > 0 for r in closed)

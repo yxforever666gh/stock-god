@@ -32,6 +32,7 @@ onBeforeUnmount(() => { active = false; requestVersion++ })
 
 const rate = value => value === null || value === undefined ? '--' : formatPercent(value)
 const ratio = value => rate(value).replace(/^\+/, '')
+const fee = value => value === null || value === undefined ? '--' : formatMoney(-Math.abs(Number(value)))
 const drawdownRate = value => value === null || value === undefined ? '--' : formatDrawdown(value)
 const colorType = value => Number(value || 0) >= 0 ? 'error' : 'success'
 const yieldClass = value => value === null || value === undefined ? '' : Number(value) >= 0 ? 'yield-positive' : 'yield-negative'
@@ -59,16 +60,16 @@ const columns = computed(() => [
 ])
 
 const accountCards = computed(() => mode.value !== 'individual' ? [] : [
-  ['账户区间', props.slot], ['初始本金', formatMoney(performance.value?.initialContribution)], ['9月21日追加', formatMoney(performance.value?.topUpContribution)], ['累计投入本金', formatMoney(performance.value?.cumulativeExternalCapital)],
-  ['历史内部划拨', formatMoney(performance.value?.netInternalTransfer)], ['账户净值', formatMoney(performance.value?.netAssetValue)], ['可用现金', formatMoney(performance.value?.cash)], ['累计净收益', formatMoney(performance.value?.netProfit), yieldClass(performance.value?.netProfit)], ['累计收益率', rate(performance.value?.cumulativeCapitalReturn ?? performance.value?.returnRate), yieldClass(performance.value?.cumulativeCapitalReturn ?? performance.value?.returnRate)],
-  ['总费用', formatMoney(performance.value?.totalFees)], ['交易事件最大回撤', drawdownRate(performance.value?.maxDrawdown), performance.value?.maxDrawdown === null || performance.value?.maxDrawdown === undefined ? '' : 'yield-negative'], ['报告时效', `准时 ${formatInteger(performance.value?.onTimeReports)} / 迟到 ${formatInteger(performance.value?.lateReports)}`],
+  ['账户区间', props.slot], ['初始本金', formatMoney(performance.value?.initialContribution)], ['9月21日追加', formatMoney(performance.value?.topUpContribution)],
+  ['累计投入本金', formatMoney(performance.value?.cumulativeExternalCapital)], ['账户净值', formatMoney(performance.value?.netAssetValue)], ['可用现金', formatMoney(performance.value?.cash)],
+  ['累计净收益', formatMoney(performance.value?.netProfit), yieldClass(performance.value?.netProfit)], ['总费用', fee(performance.value?.totalFees), performance.value?.totalFees === null || performance.value?.totalFees === undefined ? '' : 'yield-negative'], ['交易事件最大回撤', drawdownRate(performance.value?.maxDrawdown), performance.value?.maxDrawdown === null || performance.value?.maxDrawdown === undefined ? '' : 'yield-negative'],
 ])
 const periodCards = computed(() => [
-  ['区间TWR', rate(portfolio.value?.periodReturn), yieldClass(portfolio.value?.periodReturn)],
-  ['有效账户', `${formatInteger(portfolio.value?.effectiveAccountCount)} / ${formatInteger(portfolio.value?.selectedAccountCount)}`],
+  ['区间收益率', rate(portfolio.value?.periodReturn), yieldClass(portfolio.value?.periodReturn)],
+  ...(mode.value === 'individual' ? [['交易日天数', portfolio.value?.tradingDayCount === null || portfolio.value?.tradingDayCount === undefined ? '--' : `${formatInteger(portfolio.value.tradingDayCount)} 天`]] : []),
   ['实际买入', `${formatInteger(portfolio.value?.boughtTrades)} 笔`], ['已平仓', `${formatInteger(portfolio.value?.closedTrades)} 笔`], ['胜率', ratio(portfolio.value?.winRate)],
   ['封板', outcomeCard(portfolio.value?.sealed)], ['炸板', outcomeCard(portfolio.value?.broken)], ['未触板', outcomeCard(portfolio.value?.untouched)], ['待统计', `${formatInteger(portfolio.value?.pendingOutcomeCount)} 笔`],
-  ['数据不完整账户', `${formatInteger(portfolio.value?.incompleteAccountCount)} 个`], ['无活动账户', `${formatInteger(portfolio.value?.noActivityAccountCount)} 个`],
+  ['数据不完整账户', `${formatInteger(portfolio.value?.incompleteAccountCount)} 个`], ['无活动账户', `${formatInteger(portfolio.value?.noActivityAccountCount)} 个`], ['有效账户', `${formatInteger(portfolio.value?.effectiveAccountCount)} / ${formatInteger(portfolio.value?.selectedAccountCount)}`],
 ])
 
 function show(row) { detailRequest.show(row.recommendationId) }
@@ -126,7 +127,7 @@ onMounted(() => { syncURL(); void refresh() })
 
     <template v-if="mode === 'individual'">
       <n-text strong>当前独立账户</n-text>
-      <n-grid :cols="4" :x-gap="12" :y-gap="12" responsive="screen">
+      <n-grid :cols="3" :x-gap="12" :y-gap="12" responsive="screen">
         <n-gi v-for="item in accountCards" :key="item[0]"><n-card size="small"><n-statistic :label="item[0]" :value="item[1]" :class="item[2]"/></n-card></n-gi>
       </n-grid>
     </template>
@@ -136,7 +137,7 @@ onMounted(() => { syncURL(); void refresh() })
       <n-gi v-for="item in periodCards" :key="item[0]"><n-card size="small"><n-statistic :label="item[0]" :value="item[1]" :class="item[2]"/></n-card></n-gi>
     </n-grid>
     <n-alert type="info" :bordered="false">
-      {{assessment}}。区间TWR按最新完整交易日收盘更新，中和外部加资与历史内部划拨；集成账户对有真实持仓或交易暴露且估值完整的账户等权平均。胜率只统计所选实际买入日范围内的已平仓股票；封板、炸板、未触板按实际买入后的完整分钟至当日收盘互斥统计，数据不足与尚未收盘的股票单列为待统计。
+      {{assessment}}。区间收益率（TWR）按最新完整交易日收盘更新，中和外部加资与历史内部划拨；集成账户对有真实持仓或交易暴露且估值完整的账户等权平均。胜率只统计所选实际买入日范围内的已平仓股票；封板、炸板、未触板按实际买入后的完整分钟至当日收盘互斥统计，数据不足与尚未收盘的股票单列为待统计。
     </n-alert>
 
     <n-card title="收益率日变化" size="small"><PredictionPortfolioReturnChart :points="portfolio?.curve || []"/></n-card>

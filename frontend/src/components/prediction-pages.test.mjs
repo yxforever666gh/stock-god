@@ -194,8 +194,8 @@ test('prediction report explains the one-report daily limit and does not offer a
 test('prediction yield lists only bought rows and exposes one mutually exclusive limit outcome', async () => {
   const rows = [{recommendationId: 'bought', status: 'active', buyAt: '2026-09-15T09:52:00+08:00', buyPrice: 10, quantity: 100, netPnl: 8, netYieldRate: 0.008, buyDayLimitStatus: 'complete', buyDayLimitOutcome: 'sealed'}]
   globalThis.__researchPageFixtures = {
-    GetPredictionPerformance: async () => ({}),
-    GetPredictionPortfolioPerformance: async () => ({slots: ['09:50'], curve: [], sealed: {count: 1, rate: 1}, broken: {count: 0, rate: 0}, untouched: {count: 0, rate: 0}}),
+    GetPredictionPerformance: async () => ({initialContribution: 10000, topUpContribution: 20000, cumulativeExternalCapital: 30000, netAssetValue: 31545.07, cash: 280.99, netProfit: 1545.07, totalFees: 572.96, maxDrawdown: 0.0425}),
+    GetPredictionPortfolioPerformance: async () => ({slots: ['09:50'], curve: [], periodReturn: 0.0919, tradingDayCount: 12, selectedAccountCount: 1, effectiveAccountCount: 1, boughtTrades: 50, closedTrades: 45, winningTrades: 26, winRate: 0.5778, sealed: {count: 21, rate: 0.42}, broken: {count: 5, rate: 0.1}, untouched: {count: 24, rate: 0.48}, pendingOutcomeCount: 0, incompleteAccountCount: 0, noActivityAccountCount: 0}),
     ListPredictionPerformanceRecommendations: async () => rows,
   }
   const app = renderer.createApp(await pageComponent('predictionYield.vue'))
@@ -206,14 +206,18 @@ test('prediction yield lists only bought rows and exposes one mutually exclusive
     assert.deepEqual(state.rows.map(row => row.recommendationId), ['bought'])
     assert.equal(state.columns.find(column => column.key === 'quantity').render(rows[0]), '100')
     assert.equal(state.outcomeText(rows[0]), '封板')
+    assert.deepEqual(state.accountCards.map(item => item[0]), ['账户区间', '初始本金', '9月21日追加', '累计投入本金', '账户净值', '可用现金', '累计净收益', '总费用', '交易事件最大回撤'])
+    assert.equal(state.accountCards.find(item => item[0] === '总费用')[1], '-¥572.96')
+    assert.deepEqual(state.periodCards.map(item => item[0]), ['区间收益率', '交易日天数', '实际买入', '已平仓', '胜率', '封板', '炸板', '未触板', '待统计', '数据不完整账户', '无活动账户', '有效账户'])
     assert.equal(state.columns.some(column => ['hitFiveBeforeSell', 'hitLimitUpFullDay', 'hitMinusThree'].includes(column.key)), false)
     const source = await readFile(new URL('predictionYield.vue', import.meta.url), 'utf8')
     assert.match(source, /累计投入本金/)
-    assert.match(source, /历史内部划拨/)
     assert.match(source, /交易事件最大回撤/)
     assert.match(source, /独立账户/)
     assert.match(source, /集成账户/)
     assert.match(source, /买入日触板结果/)
+    assert.match(source, /:cols="3"/)
+    assert.match(source, /mode.value === 'individual' \? \[\['交易日天数'/)
     assert.match(source, /performanceSlots/)
     assert.match(source, /multiple filterable clearable/)
   } finally {

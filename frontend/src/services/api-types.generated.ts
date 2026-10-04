@@ -686,6 +686,7 @@ export type PredictionPortfolioPerformance = {
   selectedAccountCount: number
   slots: Array<string>
   to?: string
+  tradingDayCount: number | null
   untouched: PredictionOutcomeMetric
   winRate?: number | null
   winningTrades: number
