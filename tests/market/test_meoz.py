@@ -21,7 +21,7 @@ def success(fields=None, items=None):
 
 def test_fields_order_and_symbol_string():
     p = provider(lambda r: success(["tradedate", "symbol"], [["20261008", "000001"]]))
-    assert p.request("basic", {})["rows"] == [{"symbol": "000001", "tradedate": "20261008"}]
+    assert p.request("stockbasic", {})["rows"] == [{"symbol": "000001", "tradedate": "20261008"}]
 
 
 @pytest.mark.parametrize("fields,items", [(["symbol", "symbol"], []), (["symbol"], [[1]]),
@@ -29,7 +29,7 @@ def test_fields_order_and_symbol_string():
 def test_rejects_corrupt_schema(fields, items):
     p = provider(lambda r: success(fields, items))
     with pytest.raises(MeozError):
-        p.request("basic", {})
+        p.request("stockbasic", {})
 
 
 def test_switches_only_connection_failure():
@@ -40,9 +40,9 @@ def test_switches_only_connection_failure():
             raise httpx.ConnectError("contains secret-fixture", request=request)
         return success()
     p = provider(handler)
-    p.request("basic", {})
+    p.request("stockbasic", {})
     assert urls == ["https://sz.meoz.cn:6688/api", "https://sh.meoz.cn:6688/api"]
-    p.request("basic", {})
+    p.request("stockbasic", {})
     assert urls[-1] == urls[-2]
 
 
@@ -52,7 +52,7 @@ def test_permission_never_fails_over_or_leaks_secret():
         calls.append(r)
         return httpx.Response(200, json={"code": 403, "message": "secret-fixture"})
     with pytest.raises(MeozError) as exc:
-        provider(handler).request("basic", {})
+        provider(handler).request("stockbasic", {})
     assert exc.value.status == "no_permission"
     assert "secret-fixture" not in str(exc.value)
     assert len(calls) == 1
@@ -75,11 +75,11 @@ def test_retry_finite_same_node_and_respects_cutoff():
         return httpx.Response(429, headers={"Retry-After": "20"})
     p = provider(handler, sleep=delays.append)
     with pytest.raises(MeozError):
-        p.request("basic", {})
+        p.request("stockbasic", {})
     assert len(calls) == 3 and len(set(calls)) == 1 and delays == [20, 20]
     calls.clear()
     with pytest.raises(MeozError):
-        p.request("basic", {}, deadline=NOW + timedelta(seconds=5))
+        p.request("stockbasic", {}, deadline=NOW + timedelta(seconds=5))
     assert len(calls) == 1
 
 
@@ -276,3 +276,63 @@ def test_rules_and_mother_reject_latest_instead_of_requested_day(source):
     prepared = source.prepare("20261008", "20261007")
     assert prepared["complete"] is False
     assert prepared["sourceStatusJson"]["status"] == "incomplete"
+
+
+def test_suspend_no_records_is_an_empty_set_without_retry():
+    calls = []
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={
+            "code": 1002, "message": "未找到停牌复牌数据", "data": None})
+    p = provider(handler)
+    result = p.request("suspend", {"symbols": ["000001"], "startdate": "20261008",
+                                 "enddate": "20261008"}, "symbol,tradedate,suspend_type")
+    assert result["rows"] == [] and result["fields"] == ["symbol", "tradedate", "suspend_type"]
+    assert result["receivedAt"] == NOW.isoformat() and len(calls) == 1
+
+
+@pytest.mark.parametrize("api,message,data,http_status", [
+    ("stockbasic", "未找到停牌复牌数据", None, 200),
+    ("suspend", "参数或数据异常", None, 200),
+    ("suspend", "未找到停牌复牌数据", {"fields": [], "items": []}, 200),
+    ("suspend", "未找到停牌复牌数据", None, 400),
+])
+def test_no_records_does_not_hide_other_provider_failures(api, message, data, http_status):
+    p = provider(lambda r: httpx.Response(http_status, json={
+        "code": 1002, "message": message, "data": data}))
+    with pytest.raises(MeozError):
+        p.request(api, {})
+
+
+def test_stockbasic_and_empty_suspension_preserve_candidate_eligibility(source):
+    import json
+    calls = []
+    def handler(request):
+        body = json.loads(request.content)
+        api, params = body["apiname"], body["params"]
+        calls.append(api)
+        if api == "limit_pool_yes":
+            return success(["tradedate", "symbol", "pre_type", "pre_limit_times"],
+                           [["20261008", "000001", "u", 1]])
+        if api == "stockbasic":
+            return success(["symbol", "name", "market", "list_status"],
+                           [["000001", "普通股票", "主板", "L"]])
+        if api == "pricelimit":
+            return success(["symbol", "tradedate", "pre_close", "up_limit", "down_limit"],
+                           [["000001", params["tradedate"], 9, 9.9, 8.1]])
+        if api == "suspend":
+            return httpx.Response(200, json={
+                "code": 1002, "message": "未找到停牌复牌数据", "data": None})
+        raise AssertionError("unsupported production request")
+    p = provider(handler)
+    source.market.meoz = p
+    source.market.meoz_request = p.request
+    source.market.bars = lambda *a, **k: [{
+        "time": "2026-10-07T09:31:00+08:00", "open": 9.9, "high": 9.9,
+        "low": 9.9, "close": 9.9, "volume": 100}]
+    source._history_volumes = lambda *a: [100] * 20
+    result = source.prepare("20261008", "20261007")
+    assert result["complete"] and len(result["candidates"]) == 1
+    assert result["candidates"][0]["code"] == "sz000001"
+    assert "stockbasic" in calls and "basic" not in calls
+    assert not source.status()["ready"]

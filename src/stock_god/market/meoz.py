@@ -12,7 +12,7 @@ from .common import CN, MarketDataError, instrument, number, timestamp
 
 LIVE = ("https://sz.meoz.cn:6688/api", "https://sh.meoz.cn:6688/api")
 HISTORY = "https://hist.meoz.cn:6688/api"
-APIS = {"tick_history", "daily_auc_detail", "pricelimit", "basic", "suspend", "limit_pool_yes"}
+APIS = {"tick_history", "daily_auc_detail", "pricelimit", "stockbasic", "suspend", "limit_pool_yes"}
 TICK_FIELDS = "tradedate,symbol,time,close,vol,amount,transaction_num,bid1,bid2,ask1,ask2,bid_vol1,bid_vol2,ask_vol1,ask_vol2"
 
 
@@ -92,6 +92,11 @@ class MeozProvider:
                     raise MeozError("incomplete", "MeoZ 重试超出接收截止时间")
                 self.sleep(delay)
                 continue
+            # The live suspension service uses 1002/null for an empty result.
+            if (response.status_code == 200 and apiname == "suspend" and code == 1002
+                    and payload.get("message") == "未找到停牌复牌数据" and payload.get("data") is None):
+                return {"rows": [], "fields": fields.split(",") if fields else [],
+                        "source": url, "receivedAt": received.isoformat()}
             if response.status_code != 200 or code != 200:
                 raise MeozError("incomplete", "MeoZ 接口请求失败")
             data = payload.get("data")

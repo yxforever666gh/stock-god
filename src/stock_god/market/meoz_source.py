@@ -148,7 +148,7 @@ class MeozAuctionSource:
                 candidates = []
                 for start in range(0, len(symbols), 200):
                     batch = symbols[start:start + 200]
-                    basic = self._request("basic", {"symbols": ",".join(batch), "list_status": "L"},
+                    basic = self._request("stockbasic", {"symbols": ",".join(batch), "list_status": "L"},
                                           "symbol,name,market,list_status", deadline=deadline)
                     limits = self._request("pricelimit", {"symbols": batch, "tradedate": day}, deadline=deadline)
                     previous = self._request("pricelimit", {"symbols": batch, "tradedate": previous_day}, deadline=deadline)
