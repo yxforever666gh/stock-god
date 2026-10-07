@@ -178,11 +178,30 @@ class PredictionService:
                     await asyncio.to_thread(self.models.predict, vectors, model_snapshot) if vectors else []
                 )
                 items = [
-                    dict(stock_code=c["code"], stock_name=c.get("name", c["code"]), final_score=float(score))
+                    dict(
+                        stock_code=c["code"],
+                        stock_name=c.get("name", c["code"]),
+                        final_score=float(score),
+                        reference_price=next(
+                            row["fields"][1]
+                            for row in c["auctionRows"]
+                            if row["time"] >= 33900
+                            and all(positive(row["fields"][i]) for i in (1, 2, 3))
+                            and abs(row["fields"][3] / row["fields"][2] - row["fields"][1]) <= 0.011
+                        ),
+                        execution_limit_price=c["upper"] / 100,
+                    )
                     for c, score in zip(candidates, scores, strict=True)
                 ]
                 self.repo.set(
-                    "analysis_runs", {"evidence_cutoff_at": stamp(now)}, "run_id=?", (run["run_id"],)
+                    "analysis_runs",
+                    {
+                        "evidence_cutoff_at": stamp(now),
+                        "provider_name": "BASE43",
+                        "model_name": "HGB 五模型均值",
+                    },
+                    "run_id=?",
+                    (run["run_id"],),
                 )
                 run["evidence_cutoff_at"] = stamp(now)
 

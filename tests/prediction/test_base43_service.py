@@ -98,9 +98,19 @@ async def test_freeze_publishes_once_and_records_every_candidate(env, monkeypatc
                 "complete": True,
                 "factsSha256": "facts",
                 "candidates": [
-                    {"code": "sh600001", "name": "A", "auctionRows": []},
-                    {"code": "sh600002", "name": "B", "auctionRows": []},
-                    {"code": "sh600003", "name": "C", "auctionRows": []},
+                    {
+                        "code": code,
+                        "name": name,
+                        "upper": 1100,
+                        "auctionRows": [
+                            {
+                                "time": 33900,
+                                "receivedAt": "2026-09-24T09:25:00+08:00",
+                                "fields": [10, 10, 100000, 1000000] + [None] * 13,
+                            }
+                        ],
+                    }
+                    for code, name in [("sh600001", "A"), ("sh600002", "B"), ("sh600003", "C")]
                 ],
             }
 
@@ -118,6 +128,7 @@ async def test_freeze_publishes_once_and_records_every_candidate(env, monkeypatc
     assert len(rows) == 2
     assert len(records) == 3
     assert [r["allocation_base_cash"] for r in rows] == [15000.0, 15000.0]
+    assert all(r["reference_price"] == 10 and r["execution_limit_price"] == 11 for r in rows)
     assert len(env.service.repo.rows("analysis_runs")) == 1
 
 
