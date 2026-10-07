@@ -123,7 +123,7 @@ def source(tmp_path):
     return MeozAuctionSource(db, market, clock=lambda: NOW)
 
 
-def test_source_certification_requires_live_opening_receipt(source):
+def test_optional_diagnostic_receipt_does_not_grant_daily_readiness(source):
     from stock_god.market.meoz_source import SIGNATURE
     assert source.status()["ready"] is False
     with pytest.raises(ValueError):
@@ -131,34 +131,30 @@ def test_source_certification_requires_live_opening_receipt(source):
     source.certify("share", {"passed": True, "coverageVerified": True, "volumeVerified": True,
         "checkpointsVerified": True, "finalAuctionVerified": True, "sourceSignature": SIGNATURE,
         "tradingDate": "20261008", "evidenceSha256": "a" * 64})
-    assert source.status()["ready"] is True
+    assert source.status()["ready"] is False
     source.market.meoz.settings["meozApiKey"] = "different-fixture-account"
     assert source.status()["ready"] is False
 
 
-def test_source_freeze_does_not_allow_sparse_or_unverified(source):
+def test_source_freeze_does_not_allow_sparse_daily_data(source):
     c = {"code": "sz000001", "reference": 900, "auctionRows": []}
     source._write("20261008", "source_candidates", {"complete": True, "candidates": [c], "documents": []})
     raw = {"close": 10, "vol": 100, "amount": 1000}
     source._write("20261008", "source_snapshot", {"records": [{"code": c["code"], "raw": raw,
         "asOf": "2026-10-08T09:25:00+08:00", "availableAt": "2026-10-08T09:25:01+08:00"}], "documents": []})
     result = source.freeze("20261008", NOW.replace(minute=29, second=59))
-    assert not result["complete"] and result["sourceStatusJson"]["status"] == "unverified"
-    assert result["candidates"][0]["auctionRows"][0]["fields"][2] is None
+    assert not result["complete"] and result["sourceStatusJson"]["status"] == "incomplete"
+    assert result["candidates"][0]["auctionRows"][0]["fields"][2] == 10000
 
 
 def test_source_freeze_rejects_conflicting_ticks(source):
-    from stock_god.market.meoz_source import SIGNATURE
-    source.certify("share", {"passed": True, "coverageVerified": True, "volumeVerified": True,
-        "checkpointsVerified": True, "finalAuctionVerified": True, "sourceSignature": SIGNATURE,
-        "tradingDate": "20261008", "evidenceSha256": "a" * 64})
     c = {"code": "sz000001", "reference": 900, "auctionRows": []}
     source._write("20261008", "source_candidates", {"complete": True, "candidates": [c], "documents": []})
     records = []
     start = NOW.replace(minute=15, second=0)
     for sec in range(0, 601, 3):
         t = start + timedelta(seconds=sec)
-        records.append({"code": c["code"], "raw": {"close": 10, "vol": 100, "amount": 1000,
+        records.append({"code": c["code"], "raw": {"close": 10, "vol": 1, "amount": 1000,
                         "bid1": 10, "ask1": 10, "bid_vol1": 1, "ask_vol1": 1},
                         "asOf": t.isoformat(), "availableAt": (t + timedelta(seconds=1)).isoformat()})
     documents = [{"receivedAt": "2026-10-08T09:25:02+08:00", "rows": [
@@ -166,13 +162,15 @@ def test_source_freeze_rejects_conflicting_ticks(source):
     source._write("20261008", "source_snapshot", {"records": records, "documents": documents})
     cutoff = NOW.replace(minute=29, second=59)
     assert source.freeze("20261008", cutoff)["complete"]
-    conflict = {**records[1], "raw": {"close": 11, "vol": 100, "amount": 1000}}
+    assert source._read("source", "source_certification") is None
+    assert source.status()["ready"]
+    conflict = {**records[1], "raw": {"close": 11, "vol": 1, "amount": 1000}}
     source._write("20261008", "source_snapshot", {"records": records + [conflict], "documents": documents})
     assert not source.freeze("20261008", cutoff)["complete"]
     for record in records:
         record["raw"]["ask1"] = None
     source._write("20261008", "source_snapshot", {"records": records, "documents": documents})
-    invalid_book = source.inspect("20261008", cutoff, volume_unit="share")
+    invalid_book = source.inspect("20261008", cutoff, volume_unit="lot")
     assert not invalid_book["checks"]["checkpointsVerified"]
     assert not invalid_book["checks"]["coverageVerified"]
     for record in records:
@@ -222,17 +220,17 @@ def test_daily_permission_failure_survives_source_recreation(source):
     assert clone.status()["status"] == "unauthorized" and not clone.status()["ready"]
     assert clone._read("source", "source_certification") is not None
     tomorrow = MeozAuctionSource(source.database, source.market, lambda: NOW + timedelta(days=1))
-    assert tomorrow.status()["ready"]
+    assert not tomorrow.status()["ready"]
 
 
-def test_daily_freeze_failure_exposed_without_revoking_certificate(source):
+def test_daily_freeze_failure_remains_blocked_even_with_old_receipt(source):
     from stock_god.market.meoz_source import SIGNATURE
     source.certify("lot", {"passed": True, "coverageVerified": True, "volumeVerified": True,
         "checkpointsVerified": True, "finalAuctionVerified": True, "sourceSignature": SIGNATURE,
         "tradingDate": "20261008", "evidenceSha256": "a" * 64})
     source.freeze("20261008", NOW.replace(minute=29, second=59))
     assert source.status()["status"] == "incomplete" and not source.status()["ready"]
-    assert source._certificate_status()["ready"]
+    assert source.market.meoz.configured
 
 
 def test_holding_exit_rejects_conflicting_final_and_requires_corroboration(source):
@@ -336,3 +334,26 @@ def test_stockbasic_and_empty_suspension_preserve_candidate_eligibility(source):
     assert result["candidates"][0]["code"] == "sz000001"
     assert "stockbasic" in calls and "basic" not in calls
     assert not source.status()["ready"]
+
+
+def test_changed_or_cleared_key_invalidates_daily_facts_without_deleting_them(source):
+    payload = {"complete": True, "candidates": [], "documents": [{"rows": []}]}
+    source._write("20261008", "source_candidates", payload)
+    assert "keyFingerprint" not in payload
+    assert source._read("20261008", "source_candidates") is not None
+    old = source.market.meoz.settings["meozApiKey"]
+    source.market.meoz.settings["meozApiKey"] = "changed-key"
+    assert source._read("20261008", "source_candidates") is None
+    assert not source.status()["ready"]
+    source.market.meoz.settings["meozApiKey"] = ""
+    assert source.status()["status"] == "unconfigured"
+    assert not source.status()["ready"]
+    source.market.meoz.settings["meozApiKey"] = old
+    assert source._read("20261008", "source_candidates") is not None
+
+
+def test_data_signature_change_invalidates_daily_snapshot(source):
+    source._write("20261008", "source_snapshot", {"records": [], "documents": []})
+    with source.database.transaction() as con:
+        con.execute("UPDATE research2_base43_daily_tasks SET payload_json=json_set(payload_json, '$.sourceSignature', 'old-format')")
+    assert source._read("20261008", "source_snapshot") is None

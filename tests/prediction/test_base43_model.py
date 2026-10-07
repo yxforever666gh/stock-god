@@ -163,3 +163,21 @@ def test_reference_unknown_action_and_first_unknown_exit():
     inputs.records[(20261008, "sz000001")]["reference"] = 1000
     row = reference_label(inputs, "sz000001", 20261001, 20261008, {}, buy, sell)
     assert row["sold"] and row["sell_bar"] == 1
+
+
+def test_0926_and_092955_identical_frozen_inputs_have_identical_vectors_and_five_model_scores(models):
+    from copy import deepcopy
+    c = {"qualificationKnown": True, "eligible": True, "priorStreak": 1,
+         "reference": 900, "lower": 810, "upper": 1100,
+         "historicalAuctionVolumes": [100] * 20, "previousBars": [],
+         "auctionRows": [{"time": 33900, "receivedAt": "2026-09-30T09:25:01+08:00",
+                          "fields": [9, 10, 100, 1000] + [None] * 13}]}
+    early = feature_candidate(deepcopy(c))
+    late = feature_candidate(deepcopy(c))
+    np.testing.assert_array_equal(early, late)
+    snapshot = models.snapshot("20260930")
+    np.testing.assert_array_equal(models.predict([early], snapshot), models.predict([late], snapshot))
+    changed = deepcopy(c)
+    changed["auctionRows"].append({"time": 33900, "receivedAt": "2026-09-30T09:27:00+08:00",
+                                  "fields": [9, 11, 100, 1100] + [None] * 13})
+    assert feature_candidate(changed) is None

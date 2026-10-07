@@ -509,10 +509,10 @@ onBeforeUnmount(() => {
         </n-card>
 
         <n-card title="MeoZ 竞价数据" size="small">
-          <n-form-item label="Secret key：" path="meozApiKey">
-            <n-input v-model:value="formValue.meozApiKey" type="password" show-password-on="click" autocomplete="off" placeholder="输入 MeoZ secret key" @blur="handleTextFieldBlur"/>
+          <n-form-item label="API Key：" path="meozApiKey">
+            <n-input v-model:value="formValue.meozApiKey" type="password" show-password-on="click" autocomplete="off" placeholder="输入 MeoZ API Key" @blur="handleTextFieldBlur"/>
           </n-form-item>
-          <n-text depth="3">保存密钥后仍须通过竞价数据核验；鉴权失败、数据未核验或不完整时不执行新买入。</n-text>
+          <n-text depth="3">保存 API Key 后自动参与后续采集，无需人工认证；鉴权失败或当日竞价数据不完整时不执行新买入。</n-text>
         </n-card>
         <n-card title="BASE43 策略" size="small">
           <n-form-item label="自动策略：" path="predictionAutoEnabled">

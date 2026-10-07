@@ -45,7 +45,7 @@ def _full_day_suspension(rows):
 
 
 class MeozAuctionSource:
-    """Daily facts and explicit verification receipts, never guessed readiness."""
+    """Daily causal facts; readiness follows complete collection, not manual certification."""
 
     def __init__(self, database, market, clock=None):
         self.database, self.market = database, market
@@ -66,16 +66,23 @@ class MeozAuctionSource:
         with self.database.connection() as db:
             row = db.execute("SELECT payload_json FROM research2_base43_daily_tasks WHERE trading_date=? AND task_type=?",
                              (_day(day), kind)).fetchone()
-        return json.loads(row[0]) if row else None
+        payload = json.loads(row[0]) if row else None
+        if payload and _day(day) != "source" and (
+                payload.get("keyFingerprint") != self._key_fingerprint()
+                or payload.get("sourceSignature") != SIGNATURE):
+            return None
+        return payload
 
     def _write(self, day, kind, payload, status="complete"):
+        payload = deepcopy(payload)
+        payload.update(keyFingerprint=self._key_fingerprint(), sourceSignature=SIGNATURE)
         now = self.clock().isoformat()
         with self.database.transaction() as db:
             db.execute("INSERT INTO research2_base43_daily_tasks VALUES (?,?,?,?,?,?,?) ON CONFLICT(trading_date,task_type) DO UPDATE SET status=excluded.status,completed_at=excluded.completed_at,payload_json=excluded.payload_json,error=excluded.error",
                        (_day(day), kind, status, now, now, _json(payload), payload.get("error")))
 
     def status(self):
-        status = self._certificate_status()
+        status = self.market.meoz.status()
         if not self.configured:
             return status
         day = self.clock().strftime("%Y%m%d")
@@ -93,15 +100,10 @@ class MeozAuctionSource:
             daily = frozen.get("sourceStatusJson", {})
             status.update(ready=False, status=daily.get("status", "incomplete"),
                           message=daily.get("message", "当日竞价输入不完整"))
-        return status
-
-    def _certificate_status(self):
-        status = self.market.meoz.status()
-        if not self.configured:
-            return status
-        cert = self._read("source", "source_certification")
-        if cert and cert.get("signature") == SIGNATURE and cert.get("keyFingerprint") == self._key_fingerprint():
-            status.update(status="ready", ready=True, message="竞价来源已核验")
+        elif frozen and frozen.get("complete"):
+            status.update(status="ready", ready=True, message="当日竞价数据已就绪")
+        else:
+            status.update(message="已配置，等待当日完整竞价数据")
         return status
 
     def _key_fingerprint(self):
@@ -339,15 +341,15 @@ class MeozAuctionSource:
         with self._lock:
             prepared = self._read(day, "source_candidates")
             saved = self._read(day, "source_snapshot")
-            cert = self._read("source", "source_certification")
-            state = self._certificate_status()
+            state = {"configured": self.configured, "ready": self.configured,
+                     "status": "ready" if self.configured else "unconfigured",
+                     "message": "当日竞价数据已就绪" if self.configured else "竞价 API 未配置"}
             if not prepared or not prepared.get("complete") or not saved:
                 return self._bundle(False, [], [], {**state, "ready": False, "status": "incomplete", "message": "当日竞价未完整采集"})
-            unit = inspection_unit or (cert.get("volumeUnit") if cert and cert.get("signature") == SIGNATURE
-                                       and cert.get("keyFingerprint") == self._key_fingerprint() else None)
+            unit = inspection_unit or "lot"
             limit = timestamp(cutoff)
             candidates = deepcopy(prepared["candidates"])
-            complete = state["ready"] and not saved.get("error")
+            complete = state["ready"] and not saved.get("error") and bool(candidates or prepared.get("documents"))
             for c in candidates:
                 records = [r for r in saved["records"] if r["code"] == c["code"]
                            and timestamp(r["asOf"]) <= limit and timestamp(r["availableAt"]) <= limit]
@@ -377,7 +379,9 @@ class MeozAuctionSource:
                             and bid_qty is not None and bid_qty >= 0 and ask_qty is not None
                             and abs(bid_qty - ask_qty) < .001):
                         pre.append(row["time"])
-                finals = [r for r in rows if 33900 <= r["time"] < 34200]
+                finals = [r for r in rows if 33900 <= r["time"] < 34200
+                          and all(r["fields"][i] is not None and r["fields"][i] > 0 for i in (1, 2, 3))
+                          and abs(r["fields"][3] / r["fields"][2] - r["fields"][1]) <= .011]
                 checkpoints = all(any(0 <= target - t <= 6 for t in pre) for target in (33600, 33840, 33890))
                 path = checkpoints
                 path = path and bool(pre) and min(pre) <= 33306 and max(pre) >= 33890
@@ -392,6 +396,7 @@ class MeozAuctionSource:
                                 f = final["fields"]
                                 matched |= (p is not None and v is not None and amt is not None and f[1] is not None
                                     and f[2] is not None and f[3] is not None and abs(p - f[1]) < .005
+                                    and abs(p * v * 100 - amt) <= max(1, abs(amt) * .001)
                                     and abs(v * 100 - f[2]) <= 1 and abs(amt - f[3]) <= max(1, abs(amt) * .001))
                 c["coverageComplete"] = not conflict and path and matched
                 c["verification"] = {"checkpointsVerified": not conflict and checkpoints,
@@ -460,9 +465,7 @@ class MeozAuctionSource:
                 return {"complete": False, "auctionPrice": None, "buyClose": None}
             seen.setdefault(row["asOf"], row)
         final = min(rows, key=lambda r: r["asOf"])
-        cert = self._read("source", "source_certification")
-        unit = cert.get("volumeUnit") if cert and cert.get("signature") == SIGNATURE and cert.get("keyFingerprint") == self._key_fingerprint() else None
-        values = MeozProvider.auction_values(final["raw"], 0, volume_unit=unit)
+        values = MeozProvider.auction_values(final["raw"], 0, volume_unit="lot")
         verified = False
         for doc in saved.get("documents", []):
             if timestamp(doc["receivedAt"]) > cutoff:

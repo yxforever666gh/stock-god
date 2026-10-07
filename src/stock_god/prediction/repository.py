@@ -338,9 +338,9 @@ class Repository:
                 "attempt_no": (runs[0]["attempt_no"] + 1) if runs else 1,
                 "scheduled_for": stamp(scheduled),
                 "started_at": stamp(now),
-                "evidence_cutoff_at": stamp(cutoff),
+                "evidence_cutoff_at": stamp(now),
                 "evidence_window_start_at": stamp(
-                    now.replace(second=0, microsecond=0) - timedelta(minutes=5)
+                    now.replace(hour=9, minute=15, second=0, microsecond=0)
                 ),
                 "status": "running",
                 "strategy_version": STRATEGY_VERSION,
@@ -471,7 +471,7 @@ class Repository:
                     or now.date().isoformat() != stored["trading_date"]
                     or local(stored["started_at"]) > cutoff
                     or not stored["evidence_cutoff_at"]
-                    or local(stored["evidence_cutoff_at"]) > cutoff):
+                    or local(stored["evidence_cutoff_at"]) > min(cutoff, now)):
                 raise Conflict("错过盘前冻结时点，禁止补发买单")
             if not enabled(connection):
                 raise Conflict("自动策略已关闭")
@@ -496,7 +496,7 @@ class Repository:
                 item.update(recommendation_id=item.get("recommendation_id") or str(uuid.uuid4()),
                     analysis_run_id=run["run_id"], stock_code=code(item["stock_code"]), slot=DEFAULT_SLOT,
                     final_score=item.get("final_score", item.get("score")), status="buy_pending",
-                    signal_at=stamp(cutoff), target_buy_at=stamp(now.replace(hour=9, minute=30, second=0, microsecond=0)),
+                    signal_at=stamp(local(stored["evidence_cutoff_at"])), target_buy_at=stamp(now.replace(hour=9, minute=30, second=0, microsecond=0)),
                     allocation_base_cash=budget, allocation_policy="base43_frozen_equal", selection_rank=rank, selection_role="primary")
                 item.pop("score", None)
                 insert(connection, "recommendations", item)

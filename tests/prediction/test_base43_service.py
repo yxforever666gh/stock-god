@@ -17,16 +17,20 @@ class Source:
     def status(self):
         return {"ready": self.ready, "configured": True, "status": "unverified"}
 
+    def freeze(self, day, cutoff):
+        return {"complete": False}
+
 
 @pytest.mark.asyncio
-async def test_unverified_source_does_not_make_fake_report(env):
-    env.clock.at = local("2026-09-24T09:29:58+08:00")
+async def test_incomplete_source_waits_without_report_or_cash_claim(env):
+    env.clock.at = local("2026-09-24T09:26:00+08:00")
     env.service.auction_source = Source()
-    with pytest.raises(Conflict, match="竞价"):
-        await env.service.analyze()
+    assert await env.service.analyze() is None
     assert env.service.repo.rows("analysis_runs") == []
-    assert env.market.network_calls == 0
-    assert env.service._task_done("2026-09-24", "freeze")
+    assert env.service.repo.rows("execution_chains") == []
+    assert not env.service._task_done("2026-09-24", "freeze")
+    assert not env.service._freeze_due("2026-09-24", local("2026-09-24T09:26:02+08:00"))
+    assert env.service._freeze_due("2026-09-24", local("2026-09-24T09:26:03+08:00"))
 
 
 @pytest.mark.asyncio
@@ -84,13 +88,12 @@ async def test_unconfigured_source_blocks_trades_without_old_ai(env):
     assert env.market.network_calls == 0
 
 
-@pytest.mark.asyncio
-async def test_freeze_publishes_once_and_records_every_candidate(env, monkeypatch):
+@pytest.fixture
+def complete_inputs(env, monkeypatch):
     import numpy as np
 
     import stock_god.prediction.service as module
 
-    env.clock.at = local("2026-09-24T09:29:58+08:00")
 
     class CompleteSource(Source):
         def freeze(self, day, cutoff):
@@ -114,7 +117,7 @@ async def test_freeze_publishes_once_and_records_every_candidate(env, monkeypatc
                 ],
             }
 
-    env.service.auction_source = CompleteSource(True)
+    env.service.auction_source = CompleteSource(False)
     records = []
     env.service.models = SimpleNamespace(
         snapshot=lambda day: SimpleNamespace(dates=("20260924",), identity="models"),
@@ -122,13 +125,22 @@ async def test_freeze_publishes_once_and_records_every_candidate(env, monkeypatc
         record_candidate=lambda *args: records.append(args),
     )
     monkeypatch.setattr(module, "feature_candidate", lambda candidate: np.zeros(43))
+    return env.service.auction_source, records
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("at", ["09:26:00", "09:29:55"])
+async def test_complete_inputs_publish_once_with_actual_signal_and_open_buy_time(env, complete_inputs, at):
+    _, records = complete_inputs
+    env.clock.at = local("2026-09-24T" + at + "+08:00")
     await env.service.analyze()
     await env.service.analyze()
     rows = env.service.repo.rows("recommendations")
-    assert len(rows) == 2
-    assert len(records) == 3
+    assert len(rows) == 2 and len(records) == 3
     assert [r["allocation_base_cash"] for r in rows] == [15000.0, 15000.0]
     assert all(r["reference_price"] == 10 and r["execution_limit_price"] == 11 for r in rows)
+    assert all(local(r["signal_at"]) == env.clock.at for r in rows)
+    assert all(local(r["target_buy_at"]) == local("2026-09-24T09:30:00+08:00") for r in rows)
     assert len(env.service.repo.rows("analysis_runs")) == 1
 
 
@@ -198,3 +210,80 @@ async def test_close_recovers_multiple_pending_dates_but_never_seed_unknown(env,
     await env.service.finalize_metrics()
     assert calls == [("20260921", "2026-09-22"), ("20260923", "2026-09-24")]
     assert env.service._task_done("2026-09-25", "close")
+
+
+@pytest.mark.asyncio
+async def test_wait_then_complete_only_claims_cash_once(env, complete_inputs):
+    source, records = complete_inputs
+    real_freeze = source.freeze
+    source.freeze = lambda *a: {"complete": False}
+    env.clock.at = local("2026-09-24T09:26:00+08:00")
+    await env.service.analyze()
+    assert not env.service.repo.rows("analysis_runs")
+    assert not env.service.repo.rows("execution_chains")
+    source.freeze = real_freeze
+    env.clock.at = local("2026-09-24T09:26:03+08:00")
+    await env.service.analyze()
+    env.service.repo.set("accounts", {"cash": 50000}, "slot=?", ("base43",))
+    env.clock.at = local("2026-09-24T09:29:55+08:00")
+    await env.service.analyze()
+    assert len(records) == 3 and len(env.service.repo.rows("analysis_runs")) == 1
+    assert [r["allocation_base_cash"] for r in env.service.repo.rows("recommendations")] == [15000, 15000]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_inputs_stop_at_deadline_without_buy_list(env):
+    env.service.auction_source = Source()
+    env.clock.at = local("2026-09-24T09:29:59+08:00")
+    await env.service.analyze()
+    assert env.service._task_done("2026-09-24", "freeze")
+    assert not env.service.repo.rows("analysis_runs")
+    assert not env.service.repo.rows("execution_chains")
+    env.clock.at = local("2026-09-24T09:30:00+08:00")
+    with pytest.raises(Conflict):
+        await env.service.analyze()
+    assert not env.service.repo.rows("recommendations")
+
+
+@pytest.mark.asyncio
+async def test_waiting_state_survives_service_restart(env, complete_inputs):
+    from stock_god.prediction.service import PredictionService
+    source, _ = complete_inputs
+    real_freeze = source.freeze
+    source.freeze = lambda *a: {"complete": False}
+    env.clock.at = local("2026-09-24T09:26:00+08:00")
+    await env.service.analyze()
+    resumed = PredictionService(env.db, env.market, env.settings, None, env.service.audit,
+                                clock=env.clock, auction_source=source, models=env.service.models)
+    source.freeze = real_freeze
+    env.clock.at = local("2026-09-24T09:26:03+08:00")
+    assert resumed._freeze_due("2026-09-24", env.clock.at)
+    await resumed.analyze()
+    assert len(resumed.repo.rows("analysis_runs")) == 1
+    assert len(resumed.repo.rows("recommendations")) == 2
+
+
+@pytest.mark.asyncio
+async def test_permission_error_blocks_without_claim(env):
+    source = Source()
+    source.status = lambda: {"configured": True, "ready": False, "status": "unauthorized"}
+    env.service.auction_source = source
+    env.clock.at = local("2026-09-24T09:26:00+08:00")
+    await env.service.analyze()
+    assert env.service._task_done("2026-09-24", "freeze")
+    assert not env.service.repo.rows("analysis_runs")
+
+
+@pytest.mark.asyncio
+async def test_before_0926_never_claims_and_no_positive_result_is_final(env, complete_inputs):
+    import numpy as np
+    env.clock.at = local("2026-09-24T09:25:59+08:00")
+    with pytest.raises(Conflict):
+        await env.service.analyze()
+    assert not env.service.repo.rows("analysis_runs")
+    env.clock.at = local("2026-09-24T09:26:00+08:00")
+    env.service.models.predict = lambda *a: np.array([-1., -2., -3.])
+    await env.service.analyze()
+    assert env.service.repo.rows("analysis_runs")[0]["status"] == "no_recommendation"
+    assert env.service._task_done("2026-09-24", "freeze")
+    assert not env.service.repo.rows("recommendations")

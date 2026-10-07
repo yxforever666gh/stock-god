@@ -1,9 +1,7 @@
 param(
     [ValidateSet('prediction','market','storage','web','contracts')]
     [string[]]$Domain,
-    [string[]]$FrontendTest,
-    [string]$MeozAcceptance,
-    [string]$MeozKeyFile
+    [string[]]$FrontendTest
 )
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -26,13 +24,6 @@ function Invoke-ReleaseJson([string[]]$Arguments) {
 Push-Location $root
 try {
     $plan = Invoke-ReleaseJson @('plan')
-    if ([version]$plan.appVersion -ge [version]'7.0.0') {
-        if (-not $MeozAcceptance -or -not $MeozKeyFile) {
-            throw 'BASE43 releases require -MeozAcceptance and -MeozKeyFile from a passed live opening-session verification.'
-        }
-        & $python -B -m stock_god.meoz_validation --accept $MeozAcceptance --key-file $MeozKeyFile
-        if ($LASTEXITCODE -ne 0) { throw 'Live MeoZ opening-session acceptance failed; deployment and tagging are prohibited.' }
-    }
     if (-not $plan.major -and -not $Domain.Count) {
         throw 'A small version requires -Domain with the affected domain.'
     }
@@ -103,10 +94,6 @@ try {
         }
         $receipt = Invoke-ReleaseJson @('deploy','--candidate',$candidate,'--proof',$proof.proof)
         $receiptPath = Join-Path $receipt.directory 'receipt.json'
-        if ([version]$plan.appVersion -ge [version]'7.0.0') {
-            & $python -B -m stock_god.meoz_validation --accept $MeozAcceptance --key-file $MeozKeyFile --install
-            if ($LASTEXITCODE -ne 0) { throw 'Verified MeoZ configuration activation failed.' }
-        }
         Start-ScheduledTask -TaskName $taskName
         $deadline = (Get-Date).AddMinutes(3)
         while ((Get-Date) -lt $deadline) {

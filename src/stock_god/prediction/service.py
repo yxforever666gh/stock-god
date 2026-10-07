@@ -98,6 +98,20 @@ class PredictionService:
             ).fetchone()
         return row is not None and row[0] in ("success", "blocked", "failed")
 
+    def _wait_freeze(self, day, reason):
+        now = local(self.clock())
+        deadline = now.replace(hour=9, minute=29, second=59, microsecond=0)
+        self._task(day, "freeze", "blocked" if now >= deadline else "waiting", error=reason)
+
+    def _freeze_due(self, day, now):
+        with self.database.connection() as con:
+            row = con.execute(
+                "SELECT status,completed_at FROM research2_base43_daily_tasks WHERE trading_date=? AND task_type='freeze'",
+                (day,),
+            ).fetchone()
+        return row is None or (row[0] == "waiting" and (
+            not row[1] or (now - local(row[1])).total_seconds() >= 3))
+
     @staticmethod
     def _previous(market, now):
         for delta in range(1, 21):
@@ -133,34 +147,38 @@ class PredictionService:
         scheduled = local(scheduled_for or now)
         if diagnostic or parent_run_id:
             raise Conflict("BASE43不支持旧AI重跑或诊断交易入口")
-        if not (9, 29, 55) <= (now.hour, now.minute, now.second) <= (9, 29, 59):
+        deadline = now.replace(hour=9, minute=29, second=59, microsecond=0)
+        if not now.replace(hour=9, minute=26, second=0, microsecond=0) <= now <= deadline:
             raise Conflict("不在BASE43盘前冻结窗口")
         day = scheduled.date().isoformat()
         if self._task_done(day, "freeze"):
             return None
         snapshot = self._snapshot()
         if not snapshot.config.get("predictionAutoEnabled", True):
+            self._task(day, "freeze", "blocked", error="股票预测自动策略已关闭")
             raise Conflict("股票预测自动策略已关闭")
         with self._source(snapshot.config) as source:
-            if source is None or not source.status().get("ready"):
-                self._task(day, "freeze", "blocked", error="竞价来源未配置或待核验，未执行选股")
-                raise Conflict("竞价来源未配置或待核验，未执行选股")
-            # Claim and freeze cash synchronously, before provider awaits.
-            run, created = self.repo.claim_run(scheduled)
-            if not created:
-                return self.views.run(run["run_id"])
-            self._task(day, "freeze", "running")
+            state = source.status() if source else {}
+            if source is None or not state.get("configured", state.get("ready", False)):
+                self._task(day, "freeze", "blocked", error="竞价来源未配置，未执行选股")
+                raise Conflict("竞价来源未配置，未执行选股")
+            if state.get("status") in ("unauthorized", "no_permission", "error"):
+                self._task(day, "freeze", "blocked", error="竞价来源权限或配置错误")
+                return None
+            run = None
             try:
                 with self._provider(snapshot.config) as market:
                     if not await asyncio.to_thread(market.is_trading_day, now):
                         raise Conflict("非交易日")
-                cutoff = min(now, now.replace(hour=9, minute=29, second=59, microsecond=0))
+                cutoff = now
                 frozen = await asyncio.to_thread(source.freeze, day, cutoff)
                 if not frozen.get("complete"):
-                    raise Conflict("当日竞价母体或关键输入不完整，未执行选股")
+                    self._wait_freeze(day, "等待当日完整竞价母体及关键输入")
+                    return None
                 model_snapshot = await asyncio.to_thread(self.models.snapshot, day)
                 if str(model_snapshot.dates[-1]) != day.replace("-", ""):
-                    raise Conflict("当日滚动模型未准备完成")
+                    self._wait_freeze(day, "等待当日滚动模型")
+                    return None
                 candidates, vectors = frozen.get("candidates", []), []
                 for candidate in candidates:
                     for row in candidate.get("auctionRows", []):
@@ -169,8 +187,23 @@ class PredictionService:
                             raise Conflict("竞价证据越过冻结接收时点")
                     vector = feature_candidate(candidate)
                     if vector is None:
-                        raise Conflict("候选关键竞价证据不完整")
+                        self._wait_freeze(day, "等待完整43项候选输入")
+                        return None
                     vectors.append(vector)
+
+                if local(self.clock()) > deadline:
+                    self._task(day, "freeze", "blocked", error="错过盘前冻结截止时点")
+                    return None
+                # Only complete inputs may claim a run and freeze its cash budget.
+                run, created = self.repo.claim_run(scheduled)
+                if not created:
+                    return self.views.run(run["run_id"])
+                self._task(day, "freeze", "running")
+                self.repo.set("analysis_runs", {"evidence_cutoff_at": stamp(cutoff),
+                    "provider_name": "BASE43", "model_name": "HGB 五模型均值"},
+                              "run_id=?", (run["run_id"],))
+                run["evidence_cutoff_at"] = stamp(cutoff)
+                for candidate, vector in zip(candidates, vectors, strict=True):
                     await asyncio.to_thread(
                         self.models.record_candidate, day, candidate["code"], vector, candidate
                     )
@@ -193,18 +226,6 @@ class PredictionService:
                     )
                     for c, score in zip(candidates, scores, strict=True)
                 ]
-                self.repo.set(
-                    "analysis_runs",
-                    {
-                        "evidence_cutoff_at": stamp(now),
-                        "provider_name": "BASE43",
-                        "model_name": "HGB 五模型均值",
-                    },
-                    "run_id=?",
-                    (run["run_id"],),
-                )
-                run["evidence_cutoff_at"] = stamp(now)
-
                 def render(finalized, selected):
                     lines = [
                         "# BASE43 股票预测",
@@ -237,16 +258,17 @@ class PredictionService:
                 )
                 return self.views.run(result["run_id"])
             except Exception:
-                self.repo.set(
-                    "analysis_runs",
-                    {
-                        "status": "failed",
-                        "failure_reason": "BASE43证据或模型未通过冻结校验",
-                        "generated_at": stamp(self.clock()),
-                    },
-                    "run_id=? AND persisted_at IS NULL",
-                    (run["run_id"],),
-                )
+                if run is not None:
+                    self.repo.set(
+                        "analysis_runs",
+                        {
+                            "status": "failed",
+                            "failure_reason": "BASE43证据或模型未通过冻结校验",
+                            "generated_at": stamp(self.clock()),
+                        },
+                        "run_id=? AND persisted_at IS NULL",
+                        (run["run_id"],),
+                    )
                 self._task(day, "freeze", "failed", error="BASE43证据或模型未通过冻结校验")
                 log.error("BASE43 freeze failed; provider details suppressed")
                 return None
@@ -506,11 +528,16 @@ class PredictionService:
                 self._launch("poll", self._poll(now))
             if (
                 enabled
-                and (9, 29, 55) <= (now.hour, now.minute, now.second) <= (9, 29, 59)
+                and now.replace(hour=9, minute=26, second=0, microsecond=0) <= now
+                <= now.replace(hour=9, minute=29, second=59, microsecond=0)
                 and "freeze" not in self._tasks
-                and not self._task_done(day, "freeze")
+                and self._freeze_due(day, now)
             ):
                 self._launch("freeze", self._scheduled_freeze(now))
+
+            if (now > now.replace(hour=9, minute=29, second=59, microsecond=0)
+                    and "freeze" not in self._tasks and not self._task_done(day, "freeze")):
+                self._task(day, "freeze", "blocked", error="盘前截止前未取得完整输入，不补发买单")
 
             if (
                 (now.hour, now.minute) >= (15, 5)

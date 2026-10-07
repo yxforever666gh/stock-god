@@ -118,3 +118,29 @@ def test_base43_actual_fees_round_each_fractional_cent_half_up():
     buy = base43_trade_cost("sh600001", 10.15, 100)
     assert buy["stamp_duty"] == 0
     assert buy["net_cash_flow"] == -1020.01
+
+
+def test_early_publication_rejects_future_evidence_cutoff(account_repo):
+    repo = account_repo
+    repo.clock = lambda: local("2026-10-08T09:26:00+08:00")
+    run, _ = repo.claim_run(repo.clock())
+    repo.set("analysis_runs", {"evidence_cutoff_at": "2026-10-08T09:29:55+08:00"},
+             "run_id=?", (run["run_id"],))
+    with pytest.raises(Conflict):
+        repo.publish_base43(run, [dict(stock_code="sz000001", score=1)])
+    assert not repo.rows("recommendations")
+
+
+@pytest.mark.parametrize("at", ["09:29:59", "09:31:00"])
+def test_early_recommendation_never_buys_outside_opening_minute(account_repo, at):
+    repo = account_repo
+    repo.clock = lambda: local("2026-10-08T09:26:00+08:00")
+    run, _ = repo.claim_run(repo.clock())
+    repo.publish_base43(run, [dict(stock_code="sz000001", score=1)])
+    item = repo.rows("recommendations")[0]
+    assert local(item["signal_at"]) == local("2026-10-08T09:26:00+08:00")
+    assert local(item["target_buy_at"]) == local("2026-10-08T09:30:00+08:00")
+    with pytest.raises(Conflict):
+        repo.buy_base43(item["recommendation_id"], quote(), local("2026-10-09T09:30:00+08:00"),
+                       now=local("2026-10-08T" + at + "+08:00"))
+    assert not repo.rows("trades")
