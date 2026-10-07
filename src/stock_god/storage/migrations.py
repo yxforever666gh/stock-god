@@ -7,7 +7,13 @@ from hashlib import sha256
 from pathlib import Path
 
 from .archive import ARCHIVE_DDL, create_archive_schema, seal_legacy_archive, verify_archive
-from .current import BASE43_ALTERS, BASE43_DDL, apply_base43_schema, extend_base43_shape
+from .current import (
+    BASE43_ALTERS,
+    BASE43_DDL,
+    apply_base43_schema,
+    extend_base43_shape,
+    verify_base43_capital,
+)
 from .db import Database
 from .db import quote_identifier as qi
 from .historical.common import now
@@ -537,7 +543,10 @@ def _status_one(path, kind, verify, *, allow_pending=False):
                 verify_archive(db)
                 from .historical.capital import verify_capital
 
-                verify_capital(db)
+                if len(records) >= 37:
+                    verify_base43_capital(db)
+                else:
+                    verify_capital(db)
         return result
 
 

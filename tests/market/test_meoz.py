@@ -357,3 +357,84 @@ def test_data_signature_change_invalidates_daily_snapshot(source):
     with source.database.transaction() as con:
         con.execute("UPDATE research2_base43_daily_tasks SET payload_json=json_set(payload_json, '$.sourceSignature', 'old-format')")
     assert source._read("20261008", "source_snapshot") is None
+
+
+def auction_records(codes, start, end):
+    return [{"code": code, "raw": {"close": 10, "vol": 1, "amount": 1000,
+             "bid1": 10, "ask1": 10, "bid_vol1": 1, "ask_vol1": 1},
+             "asOf": at.isoformat(), "availableAt": (at + timedelta(seconds=1)).isoformat()}
+            for code in codes for at in (start + timedelta(seconds=sec)
+                                        for sec in range(0, int((end - start).total_seconds()) + 1, 3))]
+
+
+@pytest.mark.parametrize("first_rows", [[], ["000001"], ["000001", "invalid-000002"]])
+def test_poll_retries_final_corroboration_until_all_symbols_match(source, first_rows):
+    codes = ["sz000001", "sz000002"]
+    start = NOW.replace(minute=15, second=0)
+    records = auction_records(codes, start, NOW.replace(minute=24, second=57))
+    source._write("20261008", "source_candidates", {"complete": True,
+                  "candidates": [{"code": code, "reference": 900} for code in codes], "documents": []})
+    source._write("20261008", "source_snapshot", {"records": records, "documents": [], "lastPoll": None})
+    now = [NOW.replace(minute=25, second=1)]
+    source.clock = lambda: now[0]
+    requests = []
+
+    def ticks(day, symbols, *, final=False, deadline=None):
+        assert deadline == NOW.replace(minute=29, second=59)
+        return auction_records(symbols, NOW.replace(minute=25, second=0), NOW.replace(minute=25, second=0))
+
+    def detail(api, params, fields=None, **kwargs):
+        assert kwargs["deadline"] == NOW.replace(minute=29, second=59)
+        requests.append(api)
+        symbols = first_rows if len(requests) == 1 else ["000001", "000002"]
+        return {"receivedAt": now[0].isoformat(), "rows": [{
+            "symbol": symbol.removeprefix("invalid-"), "tradedate": "20261008", "m_price": 10,
+            "auc_vol": 1, "auc_amt": 1100 if symbol.startswith("invalid-") else 1000,
+        } for symbol in symbols]}
+
+    source.market.meoz_ticks = ticks
+    source._request = detail
+    assert source.poll("20261008", now[0])
+    assert not source._read("20261008", "source_snapshot")["finalComplete"]
+    assert not source.freeze("20261008", now[0])["complete"]
+    now[0] += timedelta(seconds=3)
+    assert source.poll("20261008", now[0])
+    assert source._read("20261008", "source_snapshot")["finalComplete"]
+    assert source.freeze("20261008", now[0])["complete"]
+    now[0] += timedelta(seconds=3)
+    assert source.poll("20261008", now[0])
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize("raw", [{"close": None, "vol": 1, "amount": 1000},
+    {"close": 10, "vol": None, "amount": 1000}, {"close": 10, "vol": 1, "amount": 500}])
+def test_poll_requires_qualified_final_and_never_collects_after_deadline(source, raw):
+    source._write("20261008", "source_candidates", {"complete": True,
+                  "candidates": [{"code": "sz000001", "reference": 900}], "documents": []})
+    now = [NOW.replace(minute=25, second=1)]
+    source.clock = lambda: now[0]
+    source.market.meoz_ticks = lambda *a, **k: [{"code": "sz000001", "raw": raw,
+        "asOf": NOW.replace(minute=25, second=0).isoformat(), "availableAt": now[0].isoformat()}]
+    source._request = lambda *a, **k: {"receivedAt": now[0].isoformat(), "rows": [{
+        "symbol": "000001", "tradedate": "20261008", "m_price": 10, "auc_vol": 1, "auc_amt": 1000}]}
+    assert source.poll("20261008", now[0])
+    saved = source._read("20261008", "source_snapshot")
+    assert not saved["finalComplete"]
+    now[0] = NOW.replace(minute=30, second=0)
+    assert not source.poll("20261008", now[0])
+    assert source._read("20261008", "source_snapshot") == saved
+
+
+def test_changed_key_late_collection_cannot_replace_missing_opening_coverage(source):
+    c = {"code": "sz000001", "reference": 900}
+    source._write("20261008", "source_candidates", {"complete": True, "candidates": [c], "documents": []})
+    source.market.meoz.settings["meozApiKey"] = "changed-key"
+    assert source._read("20261008", "source_candidates") is None
+    source._write("20261008", "source_candidates", {"complete": True, "candidates": [c], "documents": []})
+    records = auction_records([c["code"]], NOW.replace(minute=16, second=0), NOW.replace(minute=25, second=0))
+    source._write("20261008", "source_snapshot", {"records": records, "documents": [{
+        "receivedAt": "2026-10-08T09:25:02+08:00", "rows": [{"symbol": "000001", "m_price": 10,
+        "auc_vol": 1, "auc_amt": 1000}]}]})
+    result = source.freeze("20261008", NOW.replace(minute=26, second=0))
+    assert not result["complete"]
+    assert not result["candidates"][0]["verification"]["coverageVerified"]

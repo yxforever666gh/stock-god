@@ -1,6 +1,8 @@
 """Safety gates in the active orchestration; legacy reads never acquire providers."""
 
 from types import SimpleNamespace
+import asyncio
+from threading import Event
 
 import pytest
 
@@ -287,3 +289,197 @@ async def test_before_0926_never_claims_and_no_positive_result_is_final(env, com
     assert env.service.repo.rows("analysis_runs")[0]["status"] == "no_recommendation"
     assert env.service._task_done("2026-09-24", "freeze")
     assert not env.service.repo.rows("recommendations")
+
+
+@pytest.fixture
+def preparing_inputs(env):
+    calls = []
+    controls = SimpleNamespace(result=lambda key: {"complete": True})
+
+    class PreparingSource(Source):
+        def __init__(self, config=None):
+            self.key = (config or {}).get("meozApiKey", "")
+            self.ready = False
+
+        def with_settings(self, config):
+            return PreparingSource(config)
+
+        def prepare(self, day, previous):
+            calls.append((self.key, day, previous))
+            return controls.result(self.key)
+
+        def poll(self, *args):
+            return False
+
+    env.service.auction_source = PreparingSource()
+    env.service.models = SimpleNamespace(prepare=lambda day: None)
+    env.settings.config["meozApiKey"] = "first-key"
+    env.settings.save()
+    return controls, calls
+
+
+async def settle(service):
+    if service._tasks:
+        await asyncio.gather(*list(service._tasks.values()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["incomplete", "exception"])
+async def test_temporary_mother_failure_retries_across_0915(env, preparing_inputs, failure):
+    controls, calls = preparing_inputs
+
+    def prepare(key):
+        if len(calls) == 1 and failure == "exception":
+            raise ValueError("temporary provider failure")
+        return {"complete": len(calls) > 1, "sourceStatusJson": {"status": "incomplete"}}
+
+    controls.result = prepare
+    env.clock.at = local("2026-09-24T09:14:57+08:00")
+    await env.service.tick()
+    await settle(env.service)
+    assert not env.service._task_done("2026-09-24", "prepare")
+    env.clock.at = local("2026-09-24T09:14:59+08:00")
+    await env.service.tick()
+    await settle(env.service)
+    assert len(calls) == 1
+    env.clock.at = local("2026-09-24T09:15:00+08:00")
+    await env.service.tick()
+    await settle(env.service)
+    assert len(calls) == 2 and env.service._task_done("2026-09-24", "prepare")
+    env.clock.at = local("2026-09-24T09:15:03+08:00")
+    await env.service.tick()
+    await settle(env.service)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_changed_key_reprepares_success_and_reopens_only_unclaimed_source_block(env, preparing_inputs):
+    _, calls = preparing_inputs
+    env.clock.at = local("2026-09-24T09:10:00+08:00")
+    await env.service.tick()
+    await settle(env.service)
+    env.service._task("2026-09-24", "freeze", "blocked", error="竞价来源权限或配置错误")
+    env.clock.at = local("2026-09-24T09:26:00+08:00")
+    before = env.settings.load()
+    env.settings.config["meozApiKey"] = "second-key"
+    env.settings.save()
+    env.service.on_settings_changed(before, env.settings.load())
+    env.clock.at = local("2026-09-24T09:26:03+08:00")
+    await env.service.tick()
+    await settle(env.service)
+    assert [call[0] for call in calls] == ["first-key", "second-key"]
+    assert env.service._task_done("2026-09-24", "prepare")
+    assert not env.service._task_done("2026-09-24", "freeze")
+    assert not env.service.repo.rows("analysis_runs")
+
+
+@pytest.mark.asyncio
+async def test_old_preparation_finishes_without_overwriting_changed_key_receipt(env, preparing_inputs):
+    controls, calls = preparing_inputs
+    entered, release = Event(), Event()
+
+    def prepare(key):
+        if key == "first-key":
+            entered.set()
+            assert release.wait(10)
+        return {"complete": True}
+
+    controls.result = prepare
+    env.clock.at = local("2026-09-24T09:14:57+08:00")
+    await env.service.tick()
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        before = env.settings.load()
+        env.settings.config["meozApiKey"] = "second-key"
+        env.settings.save()
+        env.service.on_settings_changed(before, env.settings.load())
+        env.clock.at = local("2026-09-24T09:15:00+08:00")
+        await env.service.tick()
+        assert len(calls) == 1  # Drain the old worker before preparing the new snapshot.
+    finally:
+        release.set()
+        await settle(env.service)
+    assert not env.service._task_done("2026-09-24", "prepare")
+    env.clock.at = local("2026-09-24T09:15:03+08:00")
+    await env.service.tick()
+    await settle(env.service)
+    assert [call[0] for call in calls] == ["first-key", "second-key"]
+    assert env.service._task_done("2026-09-24", "prepare")
+
+
+@pytest.mark.asyncio
+async def test_mother_retries_stop_at_preopen_deadline(env, preparing_inputs):
+    controls, calls = preparing_inputs
+    controls.result = lambda key: {"complete": False, "sourceStatusJson": {"status": "incomplete"}}
+    env.clock.at = local("2026-09-24T09:29:59+08:00")
+    await env.service.tick()
+    await settle(env.service)
+    assert env.service._task_done("2026-09-24", "prepare")
+    env.clock.at = local("2026-09-24T09:30:00+08:00")
+    await env.service.tick()
+    await settle(env.service)
+    assert len(calls) == 1 and not env.service.repo.rows("recommendations")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["freeze", "predict"])
+async def test_auto_off_then_on_permanently_revokes_inflight_scoring(env, complete_inputs, stage):
+    source, _ = complete_inputs
+    target = source if stage == "freeze" else env.service.models
+    original = getattr(target, stage)
+    entered, release = Event(), Event()
+
+    def paused(*args):
+        entered.set()
+        assert release.wait(10)
+        return original(*args)
+
+    setattr(target, stage, paused)
+    env.clock.at = local("2026-09-24T09:26:00+08:00")
+    task = asyncio.create_task(env.service.analyze())
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        before = env.settings.load()
+        env.settings.config["predictionAutoEnabled"] = False
+        env.settings.save()
+        env.service.on_settings_changed(before, env.settings.load())
+        before = env.settings.load()
+        env.settings.config["predictionAutoEnabled"] = True
+        env.settings.save()
+        env.service.on_settings_changed(before, env.settings.load())
+    finally:
+        release.set()
+        await task
+    assert not env.service.repo.rows("recommendations")
+    runs = env.service.repo.rows("analysis_runs")
+    if stage == "freeze":
+        assert not runs
+    else:
+        assert runs[0]["status"] == "failed"
+    assert env.service._task_done("2026-09-24", "freeze")
+    await env.service.analyze()
+    assert len(env.service.repo.rows("analysis_runs")) == len(runs)
+
+
+@pytest.mark.asyncio
+async def test_auto_off_then_on_between_permission_check_and_claim_cannot_publish(env, complete_inputs, monkeypatch):
+    _, records = complete_inputs
+    claim = env.service.repo.claim_run
+
+    def revoke_then_claim(scheduled):
+        before = env.settings.load()
+        env.settings.config["predictionAutoEnabled"] = False
+        env.settings.save()
+        env.service.on_settings_changed(before, env.settings.load())
+        before = env.settings.load()
+        env.settings.config["predictionAutoEnabled"] = True
+        env.settings.save()
+        env.service.on_settings_changed(before, env.settings.load())
+        return claim(scheduled)
+
+    monkeypatch.setattr(env.service.repo, "claim_run", revoke_then_claim)
+    env.clock.at = local("2026-09-24T09:26:00+08:00")
+    await env.service.analyze()
+    assert not records and not env.service.repo.rows("recommendations")
+    assert env.service.repo.rows("analysis_runs")[0]["status"] == "failed"
+    assert env.service._task_done("2026-09-24", "freeze")

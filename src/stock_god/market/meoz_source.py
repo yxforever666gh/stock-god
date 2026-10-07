@@ -307,7 +307,8 @@ class MeozAuctionSource:
                             "tradedate": day, "symbols": [instrument(s)["code"][2:] for s in symbols[start:start + 200]],
                             "trademin": "0925", "side": "after", "limit": 6000},
                             "tradedate,symbol,time,m_price,auc_vol,auc_amt,um_vol,um_side", deadline=cutoff))
-                    saved["finalComplete"] = len({r["code"] for r in final}) == len(symbols)
+                    saved["finalComplete"] = all(
+                        self._collected_final(code, day, saved, min(self.clock(), cutoff)) for code in symbols)
                 saved["lastPoll"] = now.isoformat()
                 saved.pop("error", None)
                 self._write(day, "source_snapshot", saved)
@@ -322,6 +323,47 @@ class MeozAuctionSource:
         self._write(day, "source_freeze", {"complete": result["complete"],
                     "sourceStatusJson": result["sourceStatusJson"]}, "complete" if result["complete"] else "failed")
         return result
+
+    @staticmethod
+    def _valid_final(fields):
+        return (all(fields[i] is not None and math.isfinite(fields[i]) and fields[i] > 0 for i in (1, 2, 3))
+                and abs(fields[3] / fields[2] - fields[1]) <= .011)
+
+    @classmethod
+    def _matched_final(cls, fields, code, day, documents, limit):
+        if not cls._valid_final(fields):
+            return False
+        for doc in documents:
+            if timestamp(doc["receivedAt"]) > limit:
+                continue
+            for row in doc["rows"]:
+                if row.get("symbol") != code[2:] or row.get("tradedate", _day(day)) != _day(day):
+                    continue
+                p, v, amt = [number(row.get(k)) for k in ("m_price", "auc_vol", "auc_amt")]
+                if (p is not None and p > 0 and v is not None and v > 0 and amt is not None and amt > 0
+                        and abs(p - fields[1]) < .005 and abs(v * 100 - fields[2]) <= 1
+                        and abs(amt - fields[3]) <= max(1, amt * .001)
+                        and abs(p * v * 100 - amt) <= max(1, amt * .001)):
+                    return True
+        return False
+
+    @classmethod
+    def _collected_final(cls, code, day, saved, limit):
+        seen = {}
+        for row in saved["records"]:
+            at = timestamp(row["asOf"])
+            if (row["code"] != code or at.strftime("%Y%m%d") != _day(day)
+                    or not "092500" <= at.strftime("%H%M%S") < "093000"
+                    or not at <= timestamp(row["availableAt"]) <= limit):
+                continue
+            if row["asOf"] in seen and seen[row["asOf"]]["raw"] != row["raw"]:
+                return False
+            seen.setdefault(row["asOf"], row)
+        for row in sorted(seen.values(), key=lambda r: r["asOf"]):
+            values = MeozProvider.auction_values(row["raw"], 0, volume_unit="lot")
+            if cls._valid_final(values):
+                return cls._matched_final(values, code, day, saved["documents"], limit)
+        return False
 
     def inspect(self, day, cutoff, volume_unit="lot"):
         """Measure actual collection for offline approval; never grant trading readiness."""
@@ -379,25 +421,13 @@ class MeozAuctionSource:
                             and bid_qty is not None and bid_qty >= 0 and ask_qty is not None
                             and abs(bid_qty - ask_qty) < .001):
                         pre.append(row["time"])
-                finals = [r for r in rows if 33900 <= r["time"] < 34200
-                          and all(r["fields"][i] is not None and r["fields"][i] > 0 for i in (1, 2, 3))
-                          and abs(r["fields"][3] / r["fields"][2] - r["fields"][1]) <= .011]
+                finals = [r for r in rows if 33900 <= r["time"] < 34200 and self._valid_final(r["fields"])]
                 checkpoints = all(any(0 <= target - t <= 6 for t in pre) for target in (33600, 33840, 33890))
                 path = checkpoints
                 path = path and bool(pre) and min(pre) <= 33306 and max(pre) >= 33890
                 path = path and max((b - a for a, b in zip(pre, pre[1:], strict=False)), default=999) <= 6
-                matched = False
-                if finals:
-                    final = finals[0]
-                    for doc in saved["documents"]:
-                        for r in doc["rows"]:
-                            if r["symbol"] == c["code"][2:] and timestamp(doc["receivedAt"]) <= limit:
-                                p, v, amt = number(r.get("m_price")), number(r.get("auc_vol")), number(r.get("auc_amt"))
-                                f = final["fields"]
-                                matched |= (p is not None and v is not None and amt is not None and f[1] is not None
-                                    and f[2] is not None and f[3] is not None and abs(p - f[1]) < .005
-                                    and abs(p * v * 100 - amt) <= max(1, abs(amt) * .001)
-                                    and abs(v * 100 - f[2]) <= 1 and abs(amt - f[3]) <= max(1, abs(amt) * .001))
+                matched = bool(finals) and self._matched_final(
+                    finals[0]["fields"], c["code"], day, saved["documents"], limit)
                 c["coverageComplete"] = not conflict and path and matched
                 c["verification"] = {"checkpointsVerified": not conflict and checkpoints,
                     "coverageVerified": not conflict and path, "volumeVerified": not conflict and matched,
@@ -466,21 +496,7 @@ class MeozAuctionSource:
             seen.setdefault(row["asOf"], row)
         final = min(rows, key=lambda r: r["asOf"])
         values = MeozProvider.auction_values(final["raw"], 0, volume_unit="lot")
-        verified = False
-        for doc in saved.get("documents", []):
-            if timestamp(doc["receivedAt"]) > cutoff:
-                continue
-            for row in doc.get("rows", []):
-                if row.get("symbol") != code[2:] or row.get("tradedate", day) != day:
-                    continue
-                p, v, amt = [number(row.get(k)) for k in ("m_price", "auc_vol", "auc_amt")]
-                if (p is not None and p > 0 and v is not None and v > 0 and amt is not None and amt > 0
-                        and math.isfinite(values[1]) and math.isfinite(values[2]) and math.isfinite(values[3])
-                        and abs(p - values[1]) < .005 and abs(v * 100 - values[2]) <= 1
-                        and abs(amt - values[3]) <= max(1, amt * .001)
-                        and abs(p * v * 100 - amt) <= max(1, amt * .001)):
-                    verified = True
-        if not verified:
+        if not self._matched_final(values, code, day, saved.get("documents", []), cutoff):
             return {"complete": False, "auctionPrice": None, "buyClose": None}
         buy = datetime.strptime(buy_date, "%Y%m%d").replace(tzinfo=CN)
         closes = self.market.daily_closes(code, buy.isoformat(), buy.isoformat())

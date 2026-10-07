@@ -465,6 +465,8 @@ class Repository:
                 raise Conflict("旧预测报告已归档，只读")
             if stored["persisted_at"]:
                 return stored
+            if stored["status"] != "running":
+                raise Conflict("运行发布权限已撤销或运行已结束")
             now = local(self.clock())
             cutoff = now.replace(hour=9, minute=29, second=59, microsecond=0)
             if (now >= cutoff.replace(hour=9, minute=31, second=0)

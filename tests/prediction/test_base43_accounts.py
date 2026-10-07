@@ -144,3 +144,30 @@ def test_early_recommendation_never_buys_outside_opening_minute(account_repo, at
         repo.buy_base43(item["recommendation_id"], quote(), local("2026-10-09T09:30:00+08:00"),
                        now=local("2026-10-08T" + at + "+08:00"))
     assert not repo.rows("trades")
+
+
+def test_revoked_run_and_pending_seats_stay_revoked_after_reenable(account_repo):
+    from stock_god.prediction.service import PredictionService
+
+    repo = account_repo
+    service = PredictionService(repo.db, None, None, None, None, clock=repo.clock, models=object())
+    run, _ = repo.claim_run(repo.clock())
+    service.on_settings_changed({"predictionAutoEnabled": True}, {"predictionAutoEnabled": False})
+    service.on_settings_changed({"predictionAutoEnabled": False}, {"predictionAutoEnabled": True})
+    restarted = Repository(repo.db, clock=repo.clock)
+    with pytest.raises(Conflict, match="发布权限"):
+        restarted.publish_base43(run, [dict(stock_code="sz000001", score=1)])
+    assert not restarted.rows("recommendations")
+
+    # An already published list keeps its historical report, but cannot regain its buy seats.
+    later, _ = restarted.claim_run(repo.clock())
+    restarted.publish_base43(later, [dict(stock_code="sz000001", score=1)])
+    service.on_settings_changed({"predictionAutoEnabled": True}, {"predictionAutoEnabled": False})
+    service.on_settings_changed({"predictionAutoEnabled": False}, {"predictionAutoEnabled": True})
+    item = restarted.rows("recommendations")[0]
+    assert item["status"] == "analysis_only"
+    assert restarted.publish_base43(later, [dict(stock_code="sz000002", score=2)])["persisted_at"]
+    with pytest.raises(Conflict):
+        restarted.buy_base43(item["recommendation_id"], quote(), local("2026-10-09T09:30:00+08:00"),
+                             now=local("2026-10-08T09:30:00+08:00"))
+    assert not restarted.rows("trades")

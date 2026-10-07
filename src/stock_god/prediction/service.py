@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 from contextlib import contextmanager
@@ -43,6 +44,7 @@ class PredictionService:
         self._trade_lock, self._metric_lock = asyncio.Lock(), asyncio.Lock()
         self._tasks, self._chart_locks, self._chart_cache = {}, {}, {}
         self._last_email = None
+        self._publication_token = object()
         self.evidence_store = evidence_store
 
     def _snapshot(self):
@@ -69,16 +71,37 @@ class PredictionService:
                 source.close()
 
     def on_settings_changed(self, before, after):
+        previous = before.config if hasattr(before, "config") else before
         config = after.config if hasattr(after, "config") else after
+        now = local(self.clock())
         if not config.get("predictionAutoEnabled", True):
-            self._expire(local(self.clock()), False)
+            self._publication_token = object()
+            self.repo.set("analysis_runs", {
+                "status": "failed", "failure_reason": "自动策略已关闭，旧运行发布权限已撤销",
+                "generated_at": stamp(now),
+            }, "scheduled_slot=? AND status='running' AND persisted_at IS NULL", (DEFAULT_SLOT,))
+            self._expire(now, False)
+        if (self._source_key(previous) != self._source_key(config)
+                and now.replace(hour=9, minute=0, second=0, microsecond=0) <= now
+                <= now.replace(hour=9, minute=29, second=59, microsecond=0)):
+            self._task(now.date().isoformat(), "prepare", "waiting",
+                       {"keyFingerprint": self._source_key(config)}, "来源密钥已变更，等待重新准备")
+            with self.database.transaction() as con:
+                con.execute(
+                    "UPDATE research2_base43_daily_tasks SET status='waiting',completed_at=?,error=NULL "
+                    "WHERE trading_date=? AND task_type='freeze' AND status='blocked' "
+                    "AND error LIKE '竞价来源%' AND NOT EXISTS (SELECT 1 FROM research2_analysis_runs "
+                    "WHERE trading_date=? AND scheduled_slot=?)",
+                    (stamp(now), now.date().isoformat(), now.date().isoformat(), DEFAULT_SLOT),
+                )
 
-    def _task(self, day, kind, status, payload=None, error=None):
+    def _task(self, day, kind, status, payload=None, error=None, *, guard_key=None):
         with self.database.transaction() as con:
             con.execute(
                 "INSERT INTO research2_base43_daily_tasks VALUES (?,?,?,?,?,?,?) "
                 "ON CONFLICT(trading_date,task_type) DO UPDATE SET status=excluded.status, "
-                "completed_at=excluded.completed_at,payload_json=excluded.payload_json,error=excluded.error",
+                "completed_at=excluded.completed_at,payload_json=excluded.payload_json,error=excluded.error "
+                "WHERE ? IS NULL OR json_extract(research2_base43_daily_tasks.payload_json,'$.keyFingerprint')=?",
                 (
                     day,
                     kind,
@@ -87,6 +110,8 @@ class PredictionService:
                     stamp(self.clock()) if status != "running" else None,
                     json_text(payload or {}),
                     error,
+                    guard_key,
+                    guard_key,
                 ),
             )
 
@@ -113,6 +138,20 @@ class PredictionService:
             not row[1] or (now - local(row[1])).total_seconds() >= 3))
 
     @staticmethod
+    def _source_key(config):
+        return hashlib.sha256(config.get("meozApiKey", "").strip().encode()).hexdigest()
+
+    def _prepare_due(self, day, now, config):
+        with self.database.connection() as con:
+            row = con.execute(
+                "SELECT status,completed_at,payload_json FROM research2_base43_daily_tasks "
+                "WHERE trading_date=? AND task_type='prepare'", (day,),
+            ).fetchone()
+        return (row is None or json.loads(row[2]).get("keyFingerprint") != self._source_key(config)
+                or (row[0] == "waiting" and (
+                    not row[1] or (now - local(row[1])).total_seconds() >= 3)))
+
+    @staticmethod
     def _previous(market, now):
         for delta in range(1, 21):
             at = now - timedelta(days=delta)
@@ -123,26 +162,48 @@ class PredictionService:
     async def prepare_day(self, now=None):
         now = local(now or self.clock())
         day = now.date().isoformat()
-        if self._task_done(day, "prepare"):
+        deadline = now.replace(hour=9, minute=29, second=59, microsecond=0)
+        snapshot = self._snapshot()
+        key = self._source_key(snapshot.config)
+        if not self._prepare_due(day, now, snapshot.config):
             return
-        self._task(day, "prepare", "running")
+        self._task(day, "prepare", "running", {"keyFingerprint": key})
+
+        def finish(status, error=None):
+            if self._source_key(self._snapshot().config) == key:
+                self._task(day, "prepare", status, {"keyFingerprint": key}, error, guard_key=key)
+
         try:
-            snapshot = self._snapshot()
             with self._provider(snapshot.config) as market:
                 if not await asyncio.to_thread(market.is_trading_day, now):
-                    self._task(day, "prepare", "blocked", error="非交易日")
+                    finish("blocked", "非交易日")
                     return
                 await asyncio.to_thread(self.models.prepare, day)
                 with self._source(snapshot.config) as source:
-                    if source:
-                        previous = await asyncio.to_thread(self._previous, market, now)
-                        await asyncio.to_thread(source.prepare, day, previous)
-            self._task(day, "prepare", "success")
+                    if source is None:
+                        finish("blocked", "竞价来源未配置")
+                        return
+                    previous = await asyncio.to_thread(self._previous, market, now)
+                    try:
+                        prepared = await asyncio.to_thread(source.prepare, day, previous)
+                    except Exception:
+                        finish("blocked" if local(self.clock()) >= deadline else "waiting",
+                               "竞价来源暂不可用，等待重新准备")
+                        log.error("BASE43 source preparation unavailable; provider details suppressed")
+                        return
+                    if not prepared.get("complete"):
+                        state = prepared.get("sourceStatusJson", {})
+                        terminal = state.get("status") in ("unconfigured", "unauthorized", "no_permission", "error")
+                        finish("blocked" if terminal or local(self.clock()) >= deadline else "waiting",
+                               "等待完整竞价母体及资格资料")
+                        return
+            finish("success")
         except Exception:
-            self._task(day, "prepare", "failed", error="BASE43盘前准备失败")
+            finish("failed", "BASE43盘前准备失败")
             log.error("BASE43 preparation failed; provider details suppressed")
 
     async def analyze(self, scheduled_for=None, *, diagnostic=False, parent_run_id=None):
+        publication_token = self._publication_token
         now = local(self.clock())
         scheduled = local(scheduled_for or now)
         if diagnostic or parent_run_id:
@@ -194,10 +255,20 @@ class PredictionService:
                 if local(self.clock()) > deadline:
                     self._task(day, "freeze", "blocked", error="错过盘前冻结截止时点")
                     return None
+                if publication_token is not self._publication_token:
+                    self._task(day, "freeze", "blocked", error="自动策略已关闭，旧运行发布权限已撤销")
+                    return None
                 # Only complete inputs may claim a run and freeze its cash budget.
                 run, created = self.repo.claim_run(scheduled)
                 if not created:
                     return self.views.run(run["run_id"])
+                if publication_token is not self._publication_token:
+                    self.repo.set("analysis_runs", {
+                        "status": "failed", "failure_reason": "自动策略已关闭，旧运行发布权限已撤销",
+                        "generated_at": stamp(self.clock()),
+                    }, "run_id=? AND status='running' AND persisted_at IS NULL", (run["run_id"],))
+                    self._task(day, "freeze", "blocked", error="自动策略已关闭，旧运行发布权限已撤销")
+                    return None
                 self._task(day, "freeze", "running")
                 self.repo.set("analysis_runs", {"evidence_cutoff_at": stamp(cutoff),
                     "provider_name": "BASE43", "model_name": "HGB 五模型均值"},
@@ -266,7 +337,7 @@ class PredictionService:
                             "failure_reason": "BASE43证据或模型未通过冻结校验",
                             "generated_at": stamp(self.clock()),
                         },
-                        "run_id=? AND persisted_at IS NULL",
+                        "run_id=? AND status='running' AND persisted_at IS NULL",
                         (run["run_id"],),
                     )
                 self._task(day, "freeze", "failed", error="BASE43证据或模型未通过冻结校验")
@@ -516,11 +587,13 @@ class PredictionService:
     async def tick(self, now=None):
         now = local(now or self.clock())
         day = now.date().isoformat()
-        enabled = self._snapshot().config.get("predictionAutoEnabled", True)
+        snapshot = self._snapshot()
+        enabled = snapshot.config.get("predictionAutoEnabled", True)
         if now.weekday() < 5:
             if (
-                (9, 0) <= (now.hour, now.minute) < (9, 15)
-                and not self._task_done(day, "prepare")
+                now.replace(hour=9, minute=0, second=0, microsecond=0) <= now
+                <= now.replace(hour=9, minute=29, second=59, microsecond=0)
+                and self._prepare_due(day, now, snapshot.config)
                 and "prepare" not in self._tasks
             ):
                 self._launch("prepare", self.prepare_day(now))
