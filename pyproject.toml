@@ -1,6 +1,6 @@
 [project]
 name = "stock-god"
-version = "6.1.2"
+version = "7.0.0"
 description = "Stock prediction and market data services"
 requires-python = ">=3.13,<3.14"
 dependencies = [
@@ -17,6 +17,7 @@ dependencies = [
   "jieba>=0.42.1,<1",
   "jsonschema>=4.23,<5",
   "akshare>=1.17,<2",
+  "scikit-learn==1.7.2",
 ]
 
 [dependency-groups]

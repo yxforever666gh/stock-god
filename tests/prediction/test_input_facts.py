@@ -200,26 +200,3 @@ def test_compact_snapshot_keeps_raw_documents_and_never_falls_back_to_prefix():
     assert "facts" not in snapshot["sources"][2]
     assert "summary" not in snapshot["sources"][0]
     assert "prefix" not in json.dumps(snapshot)
-
-
-@pytest.mark.asyncio
-async def test_final_sent_prompt_and_audit_share_structured_facts(env):
-    original_collect = env.market.collect_prediction_evidence
-
-    def collect(*args):
-        evidence = original_collect(*args)
-        evidence["documents"].append(document("daily", bars()) | {"availableAt": evidence["cutoffAt"]})
-        evidence["prompt"] = json.dumps({"sources": [], "candidates": evidence["candidates"], "market": {}})
-        return evidence
-
-    env.market.collect_prediction_evidence = collect
-    run = await env.service.analyze(diagnostic=True)
-    assert not run["published"]
-    audit = env.audit.detail(run["runId"])["payloads"][0]
-    assert audit["finalPrompt"] == env.ai.calls[0]
-    saved = json.loads(audit["evidenceSnapshot"])
-    assert "structured-source-facts-v1" in audit["finalPrompt"]
-    raw_daily = json.loads(saved["documents"][-1]["content"])
-    assert len(raw_daily) == 61
-    assert saved["prompt"] in audit["finalPrompt"]
-    assert env.service.repo.rows("trades") == []

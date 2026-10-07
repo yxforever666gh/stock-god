@@ -154,6 +154,8 @@ def test_full_market_eastmoney_fields_are_normalized(make_market, monkeypatch):
 
 def test_minute_provider_units_are_normalized(make_market, monkeypatch):
     service = make_market()
+    # This test checks units, independently of the provider's live seven-day window.
+    monkeypatch.setattr("stock_god.market.charts.now", lambda: datetime(2026, 9, 30, 15, 1, tzinfo=CN))
     monkeypatch.setattr(
         service.http,
         "json",

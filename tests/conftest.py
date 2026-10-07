@@ -36,6 +36,7 @@ def app_config(tmp_path):
     """Create the frozen current Go schema directly, without historical migrations."""
     from stock_god.config import AppConfig
     from stock_god.storage.archive import create_archive_schema
+    from stock_god.storage.current import apply_base43_schema
     from stock_god.storage.migrations import LEDGER_SQL, MANIFESTS, _expected
 
     for kind in ("main", "minute"):
@@ -71,6 +72,7 @@ def app_config(tmp_path):
                             f"INSERT INTO {table} ({','.join(row)}) VALUES ({','.join('?' for _ in row)})",
                             tuple(row.values()),
                         )
+                apply_base43_schema(connection, "2026-09-24T09:00:00+08:00")
                 connection.execute(
                     "INSERT INTO settings(id,dark_theme,refresh_interval,update_basic_info_on_start,enable_news) VALUES(1,0,60,0,0)"
                 )

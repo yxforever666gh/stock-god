@@ -10,9 +10,8 @@ from collections import defaultdict
 
 from stock_god.jsonutil import dumps
 
-from .core import PredictionError, json_text, local, slot_at, stamp
+from .core import Conflict, PredictionError, local, slot_at
 from .evidence import parse_output, validate
-from .repository import ensure_chain, insert, update
 
 POLICY = "start-slot-ownership-v1"
 OLD_COLUMNS = ("rank", "code", "name", "score", "price", "lot_cost", "parts", "risk", "execution")
@@ -40,7 +39,11 @@ def _can_publish(run, slot):
 def _audit_result(audit, run):
     payloads = audit.detail(run["run_id"])["payloads"]
     selected = next(
-        (payload for payload in reversed(payloads) if payload.get("repairedResponse") or payload.get("rawResponse")),
+        (
+            payload
+            for payload in reversed(payloads)
+            if payload.get("repairedResponse") or payload.get("rawResponse")
+        ),
         None,
     )
     if selected is None:
@@ -51,11 +54,19 @@ def _audit_result(audit, run):
 
 
 def _old_report_items(run, output):
-    raw = {str(item.get("code") or "").lower(): item for item in output.get("recommendations", []) if isinstance(item, dict)}
+    raw = {
+        str(item.get("code") or "").lower(): item
+        for item in output.get("recommendations", [])
+        if isinstance(item, dict)
+    }
     rows = []
     for line in (run["report_markdown"] or "").splitlines():
         cells = [part.strip() for part in line.strip().strip("|").split("|")]
-        if len(cells) < len(OLD_COLUMNS) or not cells[0].isdigit() or not re.fullmatch(r"(?:sh|sz)\d{6}", cells[1], re.I):
+        if (
+            len(cells) < len(OLD_COLUMNS)
+            or not cells[0].isdigit()
+            or not re.fullmatch(r"(?:sh|sz)\d{6}", cells[1], re.I)
+        ):
             continue
         rank, code = int(cells[0]), cells[1].lower()
         source = raw.get(code)
@@ -68,18 +79,30 @@ def _old_report_items(run, output):
         score = float(cells[3])
         if abs(sum(parts) - risk - score) > 0.011:
             raise PredictionError("归档报告分项与总分不一致")
-        raw_score = sum(float(source.get(field) or 0) for field in (
-            "marketScore", "sectorScore", "stockScore", "catalystScore"
-        )) - float(source.get("riskDeduction") or 0)
+        raw_score = sum(
+            float(source.get(field) or 0)
+            for field in ("marketScore", "sectorScore", "stockScore", "catalystScore")
+        ) - float(source.get("riskDeduction") or 0)
         if abs(raw_score - score) > 0.011:
             raise PredictionError("冻结模型分数与已接受报告不一致")
         if abs(float(source.get("referencePrice") or 0) - float(cells[4])) > 0.011:
             raise PredictionError("冻结模型参考价与已接受报告不一致")
-        rows.append(dict(
-            rank=rank, code=code, name=cells[2], score=score, price=float(cells[4]),
-            lot_cost=float(cells[5]), parts=parts, risk=risk, source=source,
-        ))
-    if len(rows) != run["recommendation_count"] or [row["rank"] for row in rows] != list(range(1, len(rows) + 1)):
+        rows.append(
+            dict(
+                rank=rank,
+                code=code,
+                name=cells[2],
+                score=score,
+                price=float(cells[4]),
+                lot_cost=float(cells[5]),
+                parts=parts,
+                risk=risk,
+                source=source,
+            )
+        )
+    if len(rows) != run["recommendation_count"] or [row["rank"] for row in rows] != list(
+        range(1, len(rows) + 1)
+    ):
         raise PredictionError("归档报告入选数量或排名与持久记录不一致")
     return rows
 
@@ -95,46 +118,58 @@ def _restored_items(run, slot, audit):
         for row in accepted:
             source = row["source"]
             market, sector, stock, catalyst = row["parts"]
-            items.append(dict(
-                recommendation_id=str(uuid.uuid5(
-                    uuid.NAMESPACE_OID, f"go-stock:research2:start-slot-v1:{run['run_id']}:{row['code']}"
-                )),
-                analysis_run_id=run["run_id"],
-                slot=slot,
-                stock_code=row["code"],
-                stock_name=row["name"],
-                selection_rank=row["rank"],
-                final_score=row["score"],
-                reference_price=row["price"],
-                estimated_lot_cost=row["lot_cost"],
-                market_score=market,
-                sector_score=sector,
-                stock_score=stock,
-                catalyst_score=catalyst,
-                risk_deduction=row["risk"],
-                source_refs="\n".join(dict.fromkeys(source.get("sourceRefs") or [])),
-                summary=source.get("summary") or "",
-                quant_data=source.get("quantData") or "",
-                fresh_catalyst=source.get("freshCatalyst") or "",
-                old_background=source.get("oldBackground") or "",
-                main_risk=source.get("mainRisk") or "",
-                cancel_conditions=source.get("cancelConditions") or "",
-                buy_lower=0,
-                buy_upper=0,
-                status="buy_pending",
-                signal_at=run["persisted_at"],
-                target_buy_at=run["persisted_at"],
-            ))
+            items.append(
+                dict(
+                    recommendation_id=str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_OID,
+                            f"go-stock:research2:start-slot-v1:{run['run_id']}:{row['code']}",
+                        )
+                    ),
+                    analysis_run_id=run["run_id"],
+                    slot=slot,
+                    stock_code=row["code"],
+                    stock_name=row["name"],
+                    selection_rank=row["rank"],
+                    final_score=row["score"],
+                    reference_price=row["price"],
+                    estimated_lot_cost=row["lot_cost"],
+                    market_score=market,
+                    sector_score=sector,
+                    stock_score=stock,
+                    catalyst_score=catalyst,
+                    risk_deduction=row["risk"],
+                    source_refs="\n".join(dict.fromkeys(source.get("sourceRefs") or [])),
+                    summary=source.get("summary") or "",
+                    quant_data=source.get("quantData") or "",
+                    fresh_catalyst=source.get("freshCatalyst") or "",
+                    old_background=source.get("oldBackground") or "",
+                    main_risk=source.get("mainRisk") or "",
+                    cancel_conditions=source.get("cancelConditions") or "",
+                    buy_lower=0,
+                    buy_upper=0,
+                    status="buy_pending",
+                    signal_at=run["persisted_at"],
+                    target_buy_at=run["persisted_at"],
+                )
+            )
     elif version == "prediction-slots-v13":
         items, warnings = validate(run["run_id"], evidence, output)
         if warnings or len(items) != run["recommendation_count"]:
             raise PredictionError("归档 Python 报告与冻结证据校验不一致")
         for item in items:
-            item["recommendation_id"] = str(uuid.uuid5(
-                uuid.NAMESPACE_OID,
-                f"go-stock:research2:start-slot-v1:{run['run_id']}:{item['stock_code']}",
-            ))
-            item.update(slot=slot, status="buy_pending", signal_at=run["persisted_at"], target_buy_at=run["persisted_at"])
+            item["recommendation_id"] = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_OID,
+                    f"go-stock:research2:start-slot-v1:{run['run_id']}:{item['stock_code']}",
+                )
+            )
+            item.update(
+                slot=slot,
+                status="buy_pending",
+                signal_at=run["persisted_at"],
+                target_buy_at=run["persisted_at"],
+            )
     else:
         raise PredictionError("归档报告缺少已核对的历史策略版本")
     return items, response_hash
@@ -166,20 +201,31 @@ class StartSlotCorrection:
             winner = identity in winning_ids
             completed = local(run["persisted_at"]) if run["persisted_at"] else None
             on_time = bool(
-                completed and slot == run["scheduled_slot"] and slot_at(completed) == slot
+                completed
+                and slot == run["scheduled_slot"]
+                and slot_at(completed) == slot
                 and completed.date().isoformat() == run["trading_date"]
             )
             values: dict[str, object] = {"slot": slot}
             if run["status"] in ("success", "no_recommendation"):
                 values.update(
                     published=winner,
-                    chain_id=(str(uuid.uuid5(
-                        uuid.NAMESPACE_OID,
-                        f"go-stock:research2:execution-chain:{run['trading_date']}:{slot}",
-                    )) if winner else ""),
+                    chain_id=(
+                        str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_OID,
+                                f"go-stock:research2:execution-chain:{run['trading_date']}:{slot}",
+                            )
+                        )
+                        if winner
+                        else ""
+                    ),
                     requested_slots=5 if winner else 0,
-                    archive_reason="" if winner else (
-                        run["archive_reason"] if not _can_publish(run, slot)
+                    archive_reason=""
+                    if winner
+                    else (
+                        run["archive_reason"]
+                        if not _can_publish(run, slot)
                         else "启动区间已有先完成报告，仅保留报告"
                     ),
                     on_time=on_time,
@@ -200,44 +246,4 @@ class StartSlotCorrection:
         return payload
 
     def apply(self, plan, *, expected_hash):
-        if plan["planHash"] != expected_hash:
-            raise PredictionError("启动区间校正计划哈希已变化")
-        if self.repo.rows("allocation_replays", "plan_hash=? AND policy_version=? AND status='complete'", (expected_hash, POLICY)):
-            return {"planHash": expected_hash, "reused": True}
-        if self.plan()["planHash"] != expected_hash:
-            raise PredictionError("启动区间校正计划哈希已变化")
-        winners = {(day, slot): identity for day, slot, identity in plan["winners"]}
-        slots = {identity: values["slot"] for identity, values in plan["updates"]}
-        existing = self.repo.rows("recommendations")
-        with self.repo.db.transaction() as connection:
-            for identity, values in plan["updates"]:
-                update(connection, "analysis_runs", values, "run_id=?", (identity,))
-            connection.execute(
-                "UPDATE research2_execution_chains SET winner_run_id='',root_run_id='',latest_run_id='',"
-                "status='completed',stop_reason='启动区间重归属后无发布报告' "
-                "WHERE coalesce(winner_run_id,'')<>''"
-            )
-            for (day, slot), identity in winners.items():
-                chain = ensure_chain(connection, slot, local(day + "T09:30:00+08:00"))
-                update(connection, "execution_chains", {
-                    "winner_run_id": identity, "root_run_id": identity, "latest_run_id": identity,
-                    "target_slots": 5, "stop_reason": "",
-                }, "chain_id=?", (chain["chain_id"],))
-            for item in existing:
-                update(connection, "recommendations", {"slot": slots[item["analysis_run_id"]]},
-                       "recommendation_id=?", (item["recommendation_id"],))
-            for item in plan["restored"]:
-                insert(connection, "recommendations", item)
-            at = stamp(local())
-            insert(connection, "allocation_replays", {
-                "replay_id": "slot-correction-" + expected_hash[:40],
-                "policy_version": POLICY,
-                "plan_hash": expected_hash,
-                "status": "complete",
-                "candidate_count": len(plan["updates"]),
-                "buy_count": 0, "sell_count": 0,
-                "missing_buy_count": 0, "missing_sell_count": 0,
-                "summary_json": json_text({"winners": len(winners), "restored": len(plan["restored"])}),
-                "started_at": at, "completed_at": at,
-            })
-        return {"planHash": expected_hash, "winners": len(winners), "restored": len(plan["restored"])}
+        raise Conflict("旧预测账户已归档，禁止应用启动区间校正")

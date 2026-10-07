@@ -1,6 +1,5 @@
 import json
 
-import pytest
 
 from stock_god.prediction.evidence import build_prompt
 
@@ -53,20 +52,3 @@ def test_full_market_rows_are_not_repeated_in_the_model_prompt(env):
     assert "VENDOR_ARCHIVE_ONLY" not in prompt
     assert evidence["prompt"] in prompt
     assert "sectorState" in prompt and evidence["cutoffAt"] in prompt
-
-
-@pytest.mark.asyncio
-async def test_real_audit_retains_full_market_while_recording_exact_compact_sent_prompt(env):
-    collect = env.market.collect_prediction_evidence
-    env.market.collect_prediction_evidence = lambda *args: full_market_evidence(collect(*args))
-    run = await env.service.analyze()
-    assert run["status"] == "success"
-    sent = env.ai.calls[0]
-    audit = env.audit.detail(run["runId"])
-    payload = audit["payloads"][0]
-    archived = json.loads(payload["evidenceSnapshot"])
-    full = json.loads(archived["documents"][0]["content"])
-    assert len(full["rows"]) == 6000
-    assert full["rows"][-1]["vendorArchiveNote"] == "VENDOR_ARCHIVE_ONLY"
-    assert payload["finalPrompt"] == sent
-    assert len(sent) < 20_000 and "VENDOR_ARCHIVE_ONLY" not in sent

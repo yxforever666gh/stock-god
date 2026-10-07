@@ -80,7 +80,7 @@ onBeforeUnmount(() => { requestVersion++ })
 
 <template>
   <n-space vertical>
-    <n-alert type="info" :bordered="false">09:30至11:25每五分钟独立启动。报告按实际启动时间归区间，同区间先完成者取得发布权；11:30后完成的报告仅归档。买入跟随有效推荐，卖出由各账户的定时任务独立执行。</n-alert>
+    <n-alert type="info" :bordered="false">BASE43 使用原 43 特征与最近五模型均值，固定最多两名正分标的。盘前输入截至 09:29:59；竞价 API 未配置时不会生成选股报告。旧 AI 报告保留为只读历史。</n-alert>
     <n-checkbox v-model:checked="allReports">全部报告（包含失败、后到和午休后报告）</n-checkbox>
     <n-flex justify="end"><n-button :loading="loading" @click="refresh">刷新</n-button></n-flex>
     <n-alert v-if="listError" type="error" :bordered="false">{{ listError }}</n-alert>
@@ -91,7 +91,7 @@ onBeforeUnmount(() => { requestVersion++ })
     </n-flex>
   </n-space>
   <n-modal v-model:show="visible">
-    <n-card title="隔夜强势分析报告" closable style="width:min(1380px,96vw);max-height:94vh" @close="visible=false">
+    <n-card title="模型与归档报告" closable style="width:min(1380px,96vw);max-height:94vh" @close="visible=false">
       <n-scrollbar style="max-height:82vh">
         <n-alert v-if="detailError" type="error">{{ detailError }} <n-button text @click="detailRequest.refresh">重试</n-button></n-alert>
         <n-spin :show="detailLoading">

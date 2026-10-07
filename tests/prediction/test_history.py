@@ -3,8 +3,8 @@ from datetime import timedelta
 
 import pytest
 
-from stock_god.prediction.core import local, stamp
-from stock_god.prediction.history import classify_outcome
+from stock_god.prediction.core import Conflict, local, stamp, trade_cost
+from stock_god.prediction.history import HistoryService, classify_outcome
 from stock_god.prediction.replay import AllocationReplay, plan_hash
 from stock_god.prediction.repository import insert
 from stock_god.prediction.views import Views
@@ -41,6 +41,10 @@ class PortfolioLedger:
 
     def clock(self):
         return self.now
+
+    def row(self, table, where, params=()):
+        assert table == "accounts"
+        return {"archived_at": None}
 
     def rows(self, table, where="", params=(), order=""):
         if table == "trades":
@@ -85,6 +89,13 @@ def test_trading_day_count_handles_open_positions_holidays_and_calendar_failure(
     assert Views(PortfolioLedger(trades), unavailable).trading_day_count("09:50") is None
 
 
+def test_archived_trading_day_count_stops_at_archive_timestamp():
+    ledger = PortfolioLedger([trade("open", "buy", "2026-09-24T09:50:00+08:00")])
+    ledger.row = lambda *args: {"archived_at": "2026-09-25T16:00:00+08:00"}
+    days = Views(ledger, lambda day: day.weekday() < 5)
+    assert days.trading_day_count("09:50") == 2
+
+
 def test_integrated_portfolio_does_not_report_a_combined_trading_day_count():
     result = Views(PortfolioLedger([]), lambda day: True).portfolio(["09:50", "10:00"])
     assert result["tradingDayCount"] is None
@@ -105,30 +116,82 @@ def test_outcome_uses_only_complete_minutes_after_buy_and_requires_coverage():
         classify_outcome({"buy_at": stamp(bought)}, data)
 
 
+def seed_chart_position(env):
+    """Recorded ledger fixture; does not run any retired strategy or model."""
+    at = env.clock()
+    cost = trade_cost("sh600001", 10, 100)
+    with env.db.transaction() as connection:
+        insert(connection, "analysis_runs", {
+            "run_id": "chart-run", "slot": "base43", "trading_date": at.date().isoformat(),
+            "attempt_no": 1, "scheduled_for": stamp(at), "started_at": stamp(at),
+            "evidence_cutoff_at": stamp(at), "status": "success", "published": True,
+        })
+        insert(connection, "recommendations", {
+            "recommendation_id": "chart-position", "analysis_run_id": "chart-run",
+            "slot": "base43", "stock_code": "sh600001", "stock_name": "fixture",
+            "signal_at": stamp(at), "target_buy_at": stamp(at), "buy_at": stamp(at), "buy_market_price": 10,
+            "buy_price": 10, "buy_fees": 5.01, "quantity": 100, "status": "active",
+            "current_price": 10, "current_price_at": stamp(at),
+        })
+        insert(connection, "trades", {
+            "trade_id": "chart-buy", "recommendation_id": "chart-position", "slot": "base43",
+            "side": "buy", "traded_at": stamp(at), "market_price": 10, "quantity": 100,
+            "price_source": "fixture", **cost,
+        })
+        connection.execute("UPDATE research2_accounts SET cash=cash+? WHERE slot='base43'", (cost["net_cash_flow"],))
+
+
+def test_full_day_suspension_carries_verified_close_and_resume_uses_actual_close(env):
+    seed_chart_position(env)
+    days = [local(date) for date in ("2026-09-24", "2026-09-25", "2026-09-28")]
+    closes = {"sh600001": {
+        "2026-09-24": {"close": 10, "source": "verified-unadjusted"},
+        "2026-09-28": {"close": 11, "source": "verified-unadjusted"},
+    }}
+    history = HistoryService(env.service.repo, env.market, lambda code, day: {
+        "known": True, "fullDaySuspended": True, "reference": 1000,
+    })
+    result = {"valuationsUnavailable": 0, "valuationsCompleted": 0}
+    history._valuations("base43", days, env.service.repo.rows("recommendations"), closes, result)
+    rows = env.service.repo.rows("account_daily_valuations", order="trading_date")
+    assert [row["data_status"] for row in rows] == ["unavailable", "complete", "complete"]
+    assert [row["position_value"] for row in rows] == [1000, 1000, 1100]
+    assert rows[1]["daily_return"] == 0
+    assert rows[2]["net_asset_value"] - rows[1]["net_asset_value"] == 100
+
+
+@pytest.mark.parametrize("rules", [
+    {"known": True, "suspended": True, "fullDaySuspended": False, "reference": 1000},
+    {"known": False, "fullDaySuspended": True, "reference": 1000},
+    {"known": True, "fullDaySuspended": True, "reference": 950},
+])
+def test_missing_close_stays_unknown_for_partial_suspension_or_unverified_reference(env, rules):
+    seed_chart_position(env)
+    days = [local("2026-09-24"), local("2026-09-25")]
+    history = HistoryService(env.service.repo, env.market, lambda code, day: rules)
+    result = {"valuationsUnavailable": 0, "valuationsCompleted": 0}
+    history._valuations("base43", days, env.service.repo.rows("recommendations"), {
+        "sh600001": {"2026-09-24": {"close": 10, "source": "verified-unadjusted"}},
+    }, result)
+    row = env.service.repo.rows("account_daily_valuations", order="trading_date")[-1]
+    assert row["data_status"] == "unavailable" and row["daily_return"] is None
+    assert "missing unadjusted daily close" in row["failure_reason"]
+
+
 @pytest.mark.asyncio
-async def test_daily_valuation_preserves_cash_and_is_idempotent(env):
-    await env.service.analyze()
+async def test_archived_valuation_and_recovery_do_not_mutate_history(env):
+    legacy_replay(env)
+    before = {table: env.service.repo.rows(table) for table in ("accounts", "recommendations", "trades")}
+    await env.service.finalize_metrics()
     await env.service.process_trades()
-    cash = env.service.account()["cash"]
-    trades = env.service.repo.rows("trades")
-    for row in env.service.repo.rows("recommendations", "buy_at IS NOT NULL"):
-        env.market.history[(row["stock_code"], "2026-09-24")] = complete_day(env.clock())
-    env.clock.at = local("2026-09-24T15:05:00+08:00")
-    first = await env.service.finalize_metrics()
-    second = await env.service.finalize_metrics()
-    assert first["outcomesCompleted"] == 5 and second["outcomesCompleted"] == 0
-    assert first["valuationsCompleted"] == 1 and second["valuationsCompleted"] == 1
-    assert len(env.service.repo.rows("account_daily_valuations")) == 1
-    assert env.service.account()["cash"] == cash and env.service.repo.rows("trades") == trades
-    portfolio = env.service.portfolio_performance(["09:50", "10:00"])
-    assert portfolio["effectiveAccountCount"] == 1 and portfolio["noActivityAccountCount"] == 1
-    assert portfolio["untouched"]["count"] == 5 and portfolio["periodReturn"] < 0
+    await env.service.recover(resume=False)
+    assert {table: env.service.repo.rows(table) for table in before} == before
+    assert not env.market.network_calls and not env.ai.calls
 
 
 @pytest.mark.asyncio
 async def test_chart_cached_get_never_calls_providers_and_returns_fee_net_pnl(env):
-    await env.service.analyze()
-    await env.service.process_trades()
+    seed_chart_position(env)
     item = env.service.repo.rows("recommendations", "buy_at IS NOT NULL")[0]
     env.market.bar_rows = [
         bar(env.clock().replace(hour=9, minute=30)),
@@ -149,8 +212,7 @@ async def test_chart_cached_get_never_calls_providers_and_returns_fee_net_pnl(en
 
 @pytest.mark.asyncio
 async def test_chart_refresh_requests_holding_range_and_keeps_cached_prior_close(env, monkeypatch):
-    await env.service.analyze()
-    await env.service.process_trades()
+    seed_chart_position(env)
     item = env.service.repo.rows("recommendations", "buy_at IS NOT NULL")[0]
     rows = [
         bar(local("2026-09-23T15:00:00+08:00"), 9.5),
@@ -175,8 +237,7 @@ async def test_chart_refresh_requests_holding_range_and_keeps_cached_prior_close
 
 
 async def test_failed_chart_refresh_preserves_real_partial_cache_and_trade_markers(env, monkeypatch):
-    await env.service.analyze()
-    await env.service.process_trades()
+    seed_chart_position(env)
     item = env.service.repo.rows("recommendations", "buy_at IS NOT NULL")[0]
     env.market.bar_rows = [bar(env.clock().replace(hour=9, minute=30)), bar(env.clock(), 10.5)]
     env.clock.at += timedelta(minutes=2)
@@ -273,20 +334,10 @@ def test_replay_retains_legacy_three_buys_blocks_missing_sell_and_rebuilds_ledge
     dry = replay.run(True)
     assert (dry["buyCount"], dry["sellCount"], dry["missingSellCount"]) == (3, 2, 1)
     assert not env.service.repo.rows("trades")
-    applied = replay.run(False)
-    assert applied["planHash"] == dry["planHash"]
-    assert env.service.repo.row("recommendations", "recommendation_id=?", ("legacy-2",))[
-        "historical_sell_blocked"
-    ]
-    assert env.service.repo.row("recommendations", "recommendation_id=?", ("legacy-4",))["quantity"] == 500
-    assert (
-        env.service.repo.row("recommendations", "recommendation_id=?", ("legacy-3",))["status"]
-        == "missed_cash"
-    )
-    assert env.service.repo.row("execution_chains", "chain_id=?", ("chain",))["target_slots"] == 3
-    assert AllocationReplay(env.service.repo, env.market).run(False)["reused"]
-    assert all(row["cash"] >= 0 for row in env.service.repo.rows("accounts"))
-    assert env.service.performance("10:00")["curve"]
+    before = {table: env.service.repo.rows(table) for table in ("accounts", "recommendations", "trades")}
+    with pytest.raises(Conflict, match="归档"):
+        replay.run(False)
+    assert {table: env.service.repo.rows(table) for table in before} == before
 
 
 def test_replay_rejects_capital_timeline_drift_and_fee_hash_changes(env):

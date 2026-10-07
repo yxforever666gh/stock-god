@@ -100,6 +100,7 @@ def create_app(
     clock=None,
     shutdown=None,
 ) -> FastAPI:
+    from .market.meoz_source import MeozAuctionSource
     from .prediction.core import Conflict, NotFound
     from .prediction.router import create_router as prediction_router
     from .prediction.service import PredictionService
@@ -111,7 +112,16 @@ def create_app(
     settings = SettingsStore(database)
     market = market or MarketServices(config)
     audit = AuditStore(database)
-    prediction = PredictionService(database, market, settings, ai_factory, audit, clock=clock, mailer=mailer)
+    prediction = PredictionService(
+        database,
+        market,
+        settings,
+        ai_factory,
+        audit,
+        clock=clock,
+        mailer=mailer,
+        auction_source=MeozAuctionSource(database, market, clock=clock),
+    )
     runtime, hub = Runtime(prediction, market, settings), EventHub()
     build, ready = (
         identity(config),
@@ -129,7 +139,8 @@ def create_app(
         # Recovery never resumes retired Research 1 or knowledge jobs.
         audit.recover_replays()
         await prediction.recover(resume=config.scheduler_enabled)
-        ready["services"] = True
+        ready["model"] = prediction.models.health()
+        ready["services"] = ready["model"]["ready"]
         scheduler = (
             asyncio.create_task(runtime.run(), name="stock-god:scheduler")
             if config.scheduler_enabled
@@ -308,24 +319,7 @@ def create_app(
 
     @app.post("/api/v1/prediction/replays", operation_id="createPredictionReplay", status_code=202)
     async def create_replay(payload: Annotated[dict, Body()]):
-        if (
-            set(payload) - {"sourceOwnerId", "modelConfigId", "sourceOwnerType"}
-            or payload.get("sourceOwnerType", "research2") != "research2"
-        ):
-            raise ValueError("prediction replays accept only prediction evidence")
-        model_id, owner_id = payload.get("modelConfigId"), payload.get("sourceOwnerId")
-        if not isinstance(model_id, int) or isinstance(model_id, bool) or not isinstance(owner_id, str):
-            raise ValueError("sourceOwnerId and modelConfigId are required")
-        snapshot = settings.load()
-        if not any(model["ID"] == model_id and not model["disabled"] for model in snapshot.models):
-            raise ValueError("replay model does not belong to prediction or is disabled")
-        require_run(owner_id)
-        result = audit.create_replay(owner_id, model_id)
-        client = ai_factory(snapshot.models, force_config_id=model_id)
-        runtime.launch(
-            "replay:" + result["replayId"], lambda: audit.execute_replay(result["replayId"], client)
-        )
-        return result
+        raise Conflict("旧AI研究报告已归档，BASE43不支持AI重放")
 
     @app.get("/api/v1/prediction/replays/{id}", operation_id="getPredictionReplay")
     def get_replay(id: str):

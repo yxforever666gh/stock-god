@@ -1,27 +1,27 @@
 <script setup>
 import {computed, defineAsyncComponent, onMounted, ref, watch} from 'vue'
 import {useRoute, useRouter} from 'vue-router'
-import {PREDICTION_SLOTS, predictionSlotBuyLabel, validPredictionSlot} from '../utils/prediction-slots.js'
+import {ARCHIVED_PREDICTION_SLOTS, PREDICTION_SLOTS, predictionSlotBuyLabel, validPredictionSlot} from '../utils/prediction-slots.js'
 import {usePolling} from '../composables/usePolling.js'
 import {ListPredictionSlots} from '../services/prediction-api'
 
 const tabs = [
   {name: '股票推荐记录', component: defineAsyncComponent(() => import('./predictionRecommendations.vue'))},
-  {name: 'AI分析报告', component: defineAsyncComponent(() => import('./predictionReport.vue'))},
+  {name: '模型与归档报告', component: defineAsyncComponent(() => import('./predictionReport.vue'))},
   {name: '股票收益率', component: defineAsyncComponent(() => import('./predictionYield.vue'))},
 ]
 const route = useRoute()
 const router = useRouter()
-const selectedSlot = ref(validPredictionSlot(route.query.slot) ? String(route.query.slot) : '09:50')
+const selectedSlot = ref(validPredictionSlot(route.query.slot) ? String(route.query.slot) : 'base43')
 const slotPickerOpen = ref(false)
 const slotStates = ref([])
 async function refreshSlots() { try { slotStates.value = await ListPredictionSlots() || [] } catch { slotStates.value = [] } }
-const slotPolling = usePolling(refreshSlots, 15000, {shouldRun: () => nowTab.value !== 'AI分析报告'})
-const selectedSlotInfo = computed(() => PREDICTION_SLOTS.find(slot => slot.value === selectedSlot.value) || PREDICTION_SLOTS[0])
+const slotPolling = usePolling(refreshSlots, 15000, {shouldRun: () => nowTab.value !== '模型与归档报告'})
+const selectedSlotInfo = computed(() => [...PREDICTION_SLOTS, ...ARCHIVED_PREDICTION_SLOTS].find(slot => slot.value === selectedSlot.value) || PREDICTION_SLOTS[0])
 const selectedSlotState = computed(() => slotStates.value.find(item => item.slot === selectedSlot.value))
-const slotOptions = computed(() => PREDICTION_SLOTS.map(slot => {
+const slotOptions = computed(() => [...PREDICTION_SLOTS, ...ARCHIVED_PREDICTION_SLOTS].map(slot => {
  const state = slotStates.value.find(item => item.slot === slot.value)
- return {key: slot.value, label: slot.label, summary: predictionSlotBuyLabel(state)}
+ return {key: slot.value, label: slot.value === 'base43' ? slot.label : `归档 ${slot.label}`, summary: predictionSlotBuyLabel(state)}
 }))
 function buyTagType(state) {
  switch (state?.buyStatus) {
@@ -40,7 +40,7 @@ function updateSlot(slot) {
  if (route.query.slot !== slot) router.replace({name: 'prediction', query: {...route.query, slot}})
  void refreshSlots()
 }
-watch(() => route.query.slot, slot => updateSlot(validPredictionSlot(slot) ? String(slot) : '09:50'))
+watch(() => route.query.slot, slot => updateSlot(validPredictionSlot(slot) ? String(slot) : 'base43'))
 const nowTab = ref(tabs.some(tab => tab.name === route.query.name) ? String(route.query.name) : tabs[0].name)
 const visited = ref([nowTab.value])
 function validReportDay(value) {
@@ -75,7 +75,7 @@ function updateTab(name) {
   nowTab.value = name
   if (!visited.value.includes(name)) visited.value.push(name)
   if (route.query.name !== name) router.replace({name: 'prediction', query: {...route.query, name}})
-  if (name !== 'AI分析报告') void refreshSlots()
+  if (name !== '模型与归档报告') void refreshSlots()
 }
 watch(() => route.query.name, name => updateTab(String(name || tabs[0].name)))
 onMounted(() => slotPolling.start({immediate: true}))
@@ -83,8 +83,10 @@ onMounted(() => slotPolling.start({immediate: true}))
 
 <template>
   <n-card>
+    <n-alert v-if="selectedSlot === 'base43'" type="info" :bordered="false">{{ predictionSlotBuyLabel(selectedSlotState || {slot: 'base43'}) }}。模型：{{ selectedSlotState?.modelReady ? '已准备' : '未准备' }}。BASE43 初始本金 30,000 元，收益按实际模拟成交单独计算。</n-alert>
+    <n-alert v-else-if="selectedSlot !== 'base43'" type="info" :bordered="false">归档账户，只读；停止交易、估值与恢复写入。</n-alert>
     <div class="prediction-slot-toolbar">
-      <template v-if="nowTab === 'AI分析报告'">
+      <template v-if="nowTab === '模型与归档报告'">
         <n-button-group>
           <n-button size="small" :type="reportDay === 'recent5' ? 'primary' : 'default'" @click="updateReportDay('recent5')">最近5个交易日</n-button>
           <n-button size="small" :type="reportDay === 'all' ? 'primary' : 'default'" @click="updateReportDay('all')">全部交易日</n-button>
@@ -96,13 +98,13 @@ onMounted(() => slotPolling.start({immediate: true}))
       </template>
       <n-popover v-else v-model:show="slotPickerOpen" trigger="click" placement="bottom-start" :show-arrow="false">
         <template #trigger>
-          <n-button secondary size="small" class="prediction-slot-current-button" aria-label="选择五分钟区间">
-            <span class="prediction-slot-current-prefix">当前选择</span>
+          <n-button secondary size="small" class="prediction-slot-current-button" aria-label="选择现役或归档账户">
+            <span class="prediction-slot-current-prefix">账户</span>
             <strong>{{ selectedSlotInfo.label }}</strong>
             <span class="prediction-slot-chevron" aria-hidden="true">⌄</span>
           </n-button>
         </template>
-        <div class="prediction-slot-grid" role="group" aria-label="选择五分钟区间">
+        <div class="prediction-slot-grid" role="group" aria-label="选择现役或归档账户">
           <n-button v-for="option in slotOptions" :key="option.key" size="small" secondary
             class="prediction-slot-grid-item" :type="option.key === selectedSlot ? 'primary' : 'default'"
             :aria-current="option.key === selectedSlot ? 'true' : undefined" @click="updateSlot(option.key)">
@@ -112,15 +114,15 @@ onMounted(() => slotPolling.start({immediate: true}))
           </n-button>
         </div>
       </n-popover>
-      <div v-if="nowTab !== 'AI分析报告'" class="prediction-slot-status" aria-live="polite">
+      <div v-if="nowTab !== '模型与归档报告'" class="prediction-slot-status" aria-live="polite">
         <n-tag size="small" :type="buyTagType(selectedSlotState)" bordered="false">{{ predictionSlotBuyLabel(selectedSlotState) }}</n-tag>
       </div>
     </div>
     <n-tabs type="line" animated :value="nowTab" @update-value="updateTab">
       <n-tab-pane v-for="tab in tabs" :key="tab.name" :name="tab.name" :tab="tab.name">
         <component v-if="visited.includes(tab.name)" :is="tab.component"
-          :key="tab.name === 'AI分析报告' ? tab.name : `${tab.name}:${selectedSlot}`"
-          v-bind="tab.name === 'AI分析报告' ? {reportDay, active: nowTab === tab.name} : {slot: selectedSlot}"
+          :key="tab.name === '模型与归档报告' ? tab.name : `${tab.name}:${selectedSlot}`"
+          v-bind="tab.name === '模型与归档报告' ? {reportDay, active: nowTab === tab.name} : {slot: selectedSlot}"
           @trading-dates="updateReportDates"/>
       </n-tab-pane>
     </n-tabs>

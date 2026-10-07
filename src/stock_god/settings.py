@@ -18,6 +18,7 @@ class SettingsConflict(ValueError):
 
 DEFAULTS = {
     "tushareToken": "",
+    "meozApiKey": "",
     "crawlTimeOut": 60,
     "kDays": 60,
     "browserPath": "",
@@ -159,6 +160,7 @@ def _normalize(config: dict) -> dict:
         raise ValueError("分钟来源间隔不能为负数")
     result["privateMinuteBaseUrl"] = result["privateMinuteBaseUrl"].strip()
     result["privateMinuteApiKey"] = result["privateMinuteApiKey"].strip()
+    result["meozApiKey"] = result["meozApiKey"].strip()
     if result["privateMinuteEnabled"] and not (
         result["privateMinuteBaseUrl"] and result["privateMinuteApiKey"]
     ):
@@ -167,6 +169,7 @@ def _normalize(config: dict) -> dict:
         if not (result["privateMinuteEnabled"] and result["privateMinuteLevel"] == "1min"):
             raise ValueError("至少启用一个分钟图来源")
     valid_slots = {f"{minute // 60:02d}:{minute % 60:02d}" for minute in range(570, 690, 5)}
+    valid_slots.add("base43")
     slots = result["predictionEmailSlots"]
     if not isinstance(slots, list) or any(slot not in valid_slots for slot in slots):
         raise ValueError("邮件时间段无效")

@@ -9,7 +9,7 @@ import PredictionHistoryFooter from './PredictionHistoryFooter.vue'
 import {usePredictionDetail, usePredictionList} from '../composables/usePredictionRequests.js'
 import {formatInteger, formatMoney, formatNumber, formatPercent, formatPrice} from '../utils/number-format'
 
-const props = defineProps({slot: {type: String, default: '09:50'}})
+const props = defineProps({slot: {type: String, default: 'base43'}})
 
 const history = usePredictionList(async (limit, offset) => {
   if (offset === 0) await GetPredictionAccount(props.slot)
@@ -50,7 +50,7 @@ const defaultColumns = [
   {title: '信号时间', key: 'signalAt', width: 170, render: row => dateTime(row.signalAt)},
   {title: '排名', key: 'displaySelectionRank', width: 80, render: row => rankLabel(row.displaySelectionRank)},
   {title: '股票', key: 'stockCode', minWidth: 170, render: row => h(NButton, {text: true, type: 'primary', onClick: () => show(row)}, {default: () => `${row.stockName}（${row.stockCode}）`})},
-  {title: '最终分', key: 'finalScore', width: 90, render: row => formatNumber(row.finalScore, 1)},
+  {title: '分数', key: 'finalScore', width: 110, render: row => row.slot === 'base43' ? `${formatNumber(row.finalScore, 4)}%` : formatNumber(row.finalScore, 1)},
   {title: '参考价', key: 'referencePrice', width: 95, render: row => formatPrice(row.referencePrice)},
   {title: '成交数量', key: 'quantity', width: 100, render: row => hasBuy(row) ? formatInteger(row.quantity) : '--'},
   {title: '买/卖价', key: 'buyPrice', width: 150, render: row => `${hasBuy(row) ? formatPrice(row.buyPrice) : '--'} / ${Number(row.sellPrice || 0) > 0 ? formatPrice(row.sellPrice) : '--'}`},
@@ -67,9 +67,9 @@ onMounted(refresh)
 
 <template>
   <n-space vertical>
-    <n-alert type="info" :bordered="false">每五分钟独立研究；第一份成功落盘报告进入对应时间账户，立即按评分和可用现金买入，每账户每天最多5只；当前现金不足一手时跳过并尝试后续股票。旧持仓在账户对应刻度独立定时卖出；后到报告仅在AI分析报告中保留。</n-alert>
+    <n-alert type="info" :bordered="false">BASE43 五模型均值按正分降序、同分代码排序，最多两只。预算冻结为盘前现金；买入窗口 09:30:00—09:30:59，失败席位保留现金，不补排、不重分。</n-alert>
     <n-flex justify="space-between" align="center">
-      <n-text depth="3">每个时间段使用独立账户。买入上限按当前剩余现金除以剩余名额计算，五笔依次为 1/5、1/4、1/3、1/2、1/1；一手含费成本超过当笔上限时只买一手，否则按合法整手买到不超过上限。任何成交均不得超过当前可用现金，不借款。当前价与收益按最新行情估值。拖动表头可调整列顺序，点击股票可查看持仓期分钟走势。</n-text>
+      <n-text depth="3">现役只有 BASE43 模拟账户。两席等分盘前现金，单席使用全部盘前现金；按 100 股整手、含费预算成交，不使用当天卖款。归档历史只读。</n-text>
       <n-button :loading="loading" @click="refresh">刷新</n-button>
     </n-flex>
     <div ref="tableRef">
@@ -87,7 +87,7 @@ onMounted(refresh)
             <n-alert v-if="detail.recommendation.status === 'analysis_only'" type="info" :bordered="false" style="margin-bottom:12px">该推荐仅用于研究复盘，不会创建模拟成交或计入策略收益。</n-alert>
             <n-descriptions bordered :column="3">
               <n-descriptions-item label="股票">{{detail.recommendation.stockName}}（{{detail.recommendation.stockCode}}）</n-descriptions-item>
-              <n-descriptions-item label="评分">{{formatNumber(detail.recommendation.finalScore,1)}}</n-descriptions-item>
+              <n-descriptions-item :label="detail.recommendation.slot === 'base43' ? '预测收益分数' : '最终分'">{{detail.recommendation.slot === 'base43' ? `${formatNumber(detail.recommendation.finalScore, 4)}%` : formatNumber(detail.recommendation.finalScore, 1)}}</n-descriptions-item>
               <n-descriptions-item label="状态">{{statusLabel(detail.recommendation)}}</n-descriptions-item>
               <n-descriptions-item label="列表排名">{{rankLabel(detail.recommendation.displaySelectionRank)}}</n-descriptions-item>
               <n-descriptions-item label="报告排名">{{rankLabel(detail.recommendation.selectionRank)}}</n-descriptions-item>
@@ -99,7 +99,7 @@ onMounted(refresh)
               <n-descriptions-item label="目标 / 实际买入">{{detail.recommendation.status === 'analysis_only' ? '--' : dateTime(detail.recommendation.targetBuyAt)}} / {{dateTime(detail.recommendation.buyAt)}}</n-descriptions-item>
               <n-descriptions-item label="目标 / 实际卖出">{{dateTime(detail.recommendation.targetSellAt)}} / {{dateTime(detail.recommendation.sellAt)}}</n-descriptions-item>
               <n-descriptions-item label="证据降级" :span="3">{{degradedReason(detail.analysis)}}</n-descriptions-item>
-              <n-descriptions-item label="分项评分" :span="3">市场 {{formatNumber(detail.recommendation.marketScore, 1)}} / 板块 {{formatNumber(detail.recommendation.sectorScore, 1)}} / 个股 {{formatNumber(detail.recommendation.stockScore, 1)}} / 催化 {{formatNumber(detail.recommendation.catalystScore, 1)}}；风险扣分 {{formatNumber(detail.recommendation.riskDeduction, 1)}}。<span v-if="!hasScoreExplanation(detail.analysis)">历史未记录逐项评分说明。</span><span v-else>逐项依据与来源见完整报告。</span></n-descriptions-item>
+              <n-descriptions-item v-if="detail.recommendation.slot !== 'base43'" label="分项评分" :span="3">市场 {{formatNumber(detail.recommendation.marketScore, 1)}} / 板块 {{formatNumber(detail.recommendation.sectorScore, 1)}} / 个股 {{formatNumber(detail.recommendation.stockScore, 1)}} / 催化 {{formatNumber(detail.recommendation.catalystScore, 1)}}；风险扣分 {{formatNumber(detail.recommendation.riskDeduction, 1)}}。<span v-if="!hasScoreExplanation(detail.analysis)">历史未记录逐项评分说明。</span><span v-else>逐项依据与来源见完整报告。</span></n-descriptions-item>
               <n-descriptions-item label="入选理由" :span="3">{{detail.recommendation.summary}}</n-descriptions-item>
               <n-descriptions-item label="关键量化" :span="3">{{detail.recommendation.quantData}}</n-descriptions-item>
               <n-descriptions-item label="新催化" :span="3">{{detail.recommendation.freshCatalyst || '无可核验新催化'}}</n-descriptions-item>

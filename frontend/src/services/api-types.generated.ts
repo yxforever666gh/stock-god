@@ -489,6 +489,10 @@ export type PredictionAccountLedgerSnapshot = {
 }
 
 export type PredictionAccountOverview = {
+  archivedAt?: string | null
+  auctionSourceConfigured?: boolean
+  auctionSourceMessage?: string
+  auctionSourceStatus?: "unconfigured" | "unauthorized" | "unverified" | "ready" | "incomplete" | "error"
   baselineAt?: string | null
   baselineNetAssetValue?: number
   cash: number
@@ -497,6 +501,7 @@ export type PredictionAccountOverview = {
   initialCash: number
   initialContribution: number
   lastValuedAt: string
+  modelReady?: boolean
   netAssetValue: number
   netInternalTransfer: number
   netProfit: number
@@ -505,6 +510,7 @@ export type PredictionAccountOverview = {
   positionValue: number
   returnRate: number
   slot?: string
+  strategyVersion?: string
   topUpContribution: number
   valuationBasis: string
 }
@@ -792,18 +798,24 @@ export type PredictionSettings = {
 }
 
 export type PredictionSlotStatus = {
+  archivedAt?: string | null
+  auctionSourceConfigured?: boolean
+  auctionSourceMessage?: string
+  auctionSourceStatus?: "unconfigured" | "unauthorized" | "unverified" | "ready" | "incomplete" | "error"
   boughtCount: number
   buyStatus: "awaiting_report" | "awaiting_quote" | "bought_full" | "bought_partial" | "no_recommendation" | "cutoff" | "disabled" | "failed" | "processing" | "no_purchase"
   buyTargetCount: number
   label: string
+  modelReady?: boolean
   openPositionCount: number
   pendingBuyCount: number
   reportOnTime?: boolean | null
-  reportStatus: "awaiting" | "success" | "no_recommendation" | "failed" | "cutoff" | "disabled"
+  reportStatus: "awaiting" | "success" | "no_recommendation" | "failed" | "cutoff" | "disabled" | "unconfigured" | "archived"
   sellCompletedAt?: string | null
   slot: string
   status: string
   stopReason?: string
+  strategyVersion?: string
   tradingDate: string
   winnerRunId: string
 }

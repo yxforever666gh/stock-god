@@ -11,9 +11,9 @@ import PredictionHistoryFooter from './PredictionHistoryFooter.vue'
 import PredictionPortfolioReturnChart from './PredictionPortfolioReturnChart.vue'
 import {usePredictionDetail, usePredictionList} from '../composables/usePredictionRequests.js'
 
-const props = defineProps({slot: {type: String, default: '09:50'}})
+const props = defineProps({slot: {type: String, default: 'base43'}})
 const route = useRoute(), router = useRouter(), message = useMessage()
-const mode = ref(route.query.performanceMode === 'integrated' ? 'integrated' : 'individual')
+const mode = ref('individual')
 const querySlots = String(route.query.performanceSlots || '').split(',').filter(validPredictionSlot)
 const selectedSlots = ref(querySlots.length ? [...new Set(querySlots)] : PREDICTION_SLOTS.map(item => item.value))
 const fromDate = ref(/^\d{4}-\d{2}-\d{2}$/.test(String(route.query.performanceFrom || '')) ? String(route.query.performanceFrom) : null)
@@ -60,7 +60,7 @@ const columns = computed(() => [
 ])
 
 const accountCards = computed(() => mode.value !== 'individual' ? [] : [
-  ['账户区间', props.slot], ['初始本金', formatMoney(performance.value?.initialContribution)], ['9月21日追加', formatMoney(performance.value?.topUpContribution)],
+  ['账户区间', props.slot], ['初始本金', formatMoney(performance.value?.initialContribution)], ['追加本金', formatMoney(performance.value?.topUpContribution)],
   ['累计投入本金', formatMoney(performance.value?.cumulativeExternalCapital)], ['账户净值', formatMoney(performance.value?.netAssetValue)], ['可用现金', formatMoney(performance.value?.cash)],
   ['累计净收益', formatMoney(performance.value?.netProfit), yieldClass(performance.value?.netProfit)], ['总费用', fee(performance.value?.totalFees), performance.value?.totalFees === null || performance.value?.totalFees === undefined ? '' : 'yield-negative'], ['交易事件最大回撤', drawdownRate(performance.value?.maxDrawdown), performance.value?.maxDrawdown === null || performance.value?.maxDrawdown === undefined ? '' : 'yield-negative'],
 ])
@@ -85,7 +85,7 @@ function syncURL() {
 }
 async function refresh() {
   if (!active) return
-  if (!effectiveSlots.value.length) { message.warning('请至少选择一个五分钟账户'); return }
+  if (!effectiveSlots.value.length) { message.warning('请至少选择一个账户'); return }
   if (fromDate.value && toDate.value && fromDate.value > toDate.value) { message.error('开始日期不能晚于结束日期'); return }
   const version = ++requestVersion
   loading.value = true
@@ -111,14 +111,7 @@ onMounted(() => { syncURL(); void refresh() })
 <template>
   <n-space vertical size="large">
     <n-flex align="center" :wrap="true" class="performance-filter-bar">
-      <n-radio-group v-model:value="mode" size="small">
-        <n-radio-button value="individual">独立账户</n-radio-button>
-        <n-radio-button value="integrated">集成账户</n-radio-button>
-      </n-radio-group>
-      <template v-if="mode === 'integrated'">
-        <n-select v-model:value="selectedSlots" multiple filterable clearable max-tag-count="responsive" :options="slotOptions" placeholder="选择五分钟账户" class="slot-multi-select"/>
-        <n-button size="small" @click="selectAllSlots">全选24个</n-button>
-      </template>
+
       <n-date-picker v-model:formatted-value="fromDate" type="date" value-format="yyyy-MM-dd" clearable placeholder="开始日期" :is-date-disabled="ts => ts > Date.now()"/>
       <span>至</span>
       <n-date-picker v-model:formatted-value="toDate" type="date" value-format="yyyy-MM-dd" clearable placeholder="结束日期" :is-date-disabled="ts => ts > Date.now()"/>
@@ -157,7 +150,7 @@ onMounted(() => { syncURL(); void refresh() })
               <n-descriptions-item label="净收益"><n-text v-if="hasBuy(detail.recommendation)" class="yield-table-value" :type="colorType(detail.recommendation.netPnl)" strong>{{formatMoney(detail.recommendation.netPnl)}}</n-text><span v-else>--</span></n-descriptions-item>
               <n-descriptions-item label="净收益率"><n-text v-if="hasBuy(detail.recommendation)" class="yield-table-value" :type="colorType(detail.recommendation.netYieldRate)" strong>{{rate(detail.recommendation.netYieldRate)}}</n-text><span v-else>--</span></n-descriptions-item>
               <n-descriptions-item label="买入日触板结果">{{outcomeText(detail.recommendation)}}</n-descriptions-item>
-              <n-descriptions-item label="最终分">{{formatNumber(detail.recommendation.finalScore, 1)}}</n-descriptions-item>
+              <n-descriptions-item :label="detail.recommendation.slot === 'base43' ? '预测收益分数' : '最终分'">{{detail.recommendation.slot === 'base43' ? `${formatNumber(detail.recommendation.finalScore, 4)}%` : formatNumber(detail.recommendation.finalScore, 1)}}</n-descriptions-item>
               <n-descriptions-item label="状态">{{statusLabels[detail.recommendation.status] || detail.recommendation.status}}</n-descriptions-item>
               <n-descriptions-item label="信号时间">{{dateTime(detail.recommendation.signalAt)}}</n-descriptions-item>
               <n-descriptions-item label="启动时间">{{dateTime(detail.analysis.startedAt)}}</n-descriptions-item>

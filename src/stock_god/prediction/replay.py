@@ -11,11 +11,12 @@ from typing import Any
 from stock_god.jsonutil import dumps
 
 from .core import (
-    ALLOCATION_POLICY,
-    SLOTS,
+    LEGACY_SLOTS as SLOTS,
+)
+from .core import (
+    Conflict,
     PredictionError,
     dto,
-    json_text,
     local,
     next_session,
     positive,
@@ -24,8 +25,7 @@ from .core import (
     trade_cost,
     upper_limit,
 )
-from .history import HistoryService, bar_time, valid_bar
-from .repository import insert, one, update
+from .history import bar_time, valid_bar
 
 POLICY = "remaining_cash_by_open_slots_ashare_cost_v2"
 MODE = "historical_allocation_replay_v1"
@@ -165,11 +165,14 @@ class AllocationReplay:
             for row in self.repo.rows(
                 "analysis_runs", "status='success'", order="trading_date,julianday(generated_at),id"
             )
+            if row["slot"] in SLOTS
         }
         runs = {identity: row for identity, row in successful.items() if row["published"]}
         if not runs:
             raise PredictionError("没有成功报告可供历史回放")
-        historical_items = [r for r in self.repo.rows("recommendations") if r["analysis_run_id"] in successful]
+        historical_items = [
+            r for r in self.repo.rows("recommendations") if r["analysis_run_id"] in successful
+        ]
         items = [r for r in historical_items if r["analysis_run_id"] in runs]
         if not items:
             raise PredictionError("没有推荐记录可供历史回放")
@@ -177,19 +180,24 @@ class AllocationReplay:
         active = {r["recommendation_id"] for r in items}
         stored = {}
         for trade in self.repo.rows("trades"):
+            if trade["slot"] not in SLOTS:
+                continue
             if trade["recommendation_id"] not in known:
                 raise PredictionError("存在成功报告历史之外的交易")
             if trade["side"] == "sell" and trade["recommendation_id"] in active:
                 if trade["recommendation_id"] in stored:
                     raise PredictionError("同一推荐有多笔历史卖出")
                 stored[trade["recommendation_id"]] = trade
-        chains = self.repo.rows("execution_chains", order="trading_date,slot")
+        chains = [
+            r for r in self.repo.rows("execution_chains", order="trading_date,slot") if r["slot"] in SLOTS
+        ]
         if any(row["target_slots"] not in (3, 5) for row in chains):
             raise PredictionError("不支持的历史账户买入上限")
         targets = {(row["slot"], row["trading_date"]): row["target_slots"] for row in chains}
         capital = self.repo.rows(
             "account_capital_events", "external=1", order="julianday(effective_at),event_id"
         )
+        capital = [r for r in capital if r["slot"] in SLOTS]
         by_slot = {slot: [row for row in capital if row["slot"] == slot] for slot in SLOTS}
         template = None
         for slot, events in by_slot.items():
@@ -425,6 +433,8 @@ class AllocationReplay:
         }
 
     def run(self, dry_run=True):
+        if not dry_run:
+            raise Conflict("旧预测账户已归档，禁止应用交易回放")
         plan = self.build()
         result = {
             "replayId": plan["replayId"],
@@ -440,206 +450,4 @@ class AllocationReplay:
             "missing": plan["gaps"],
             "accountCash": plan["cash"],
         }
-        if dry_run:
-            return result
-        with self.repo.db.transaction() as connection:
-            if one(
-                connection,
-                "SELECT id FROM research2_allocation_replays WHERE plan_hash=? AND status='complete'",
-                (plan["hash"],),
-            ):
-                result["reused"] = True
-            else:
-                connection.execute("DELETE FROM research2_trades")
-                connection.execute(
-                    "DELETE FROM research2_account_capital_events WHERE event_type='legacy_pool_transfer' AND external=0"
-                )
-                connection.execute(
-                    "DELETE FROM research2_account_ledger_snapshots WHERE valuation_basis='capital_ledger_v1'"
-                )
-                connection.execute("DELETE FROM research2_account_daily_valuations")
-                for item in self.repo.rows(
-                    "recommendations",
-                    "analysis_run_id IN (SELECT run_id FROM research2_analysis_runs "
-                    "WHERE status='success' AND published=0)",
-                ):
-                    self._apply_state(
-                        connection,
-                        {
-                            "item": item,
-                            "status": "analysis_only",
-                            "reason": "启动区间重归属后仅保留分析",
-                            "failure": "",
-                            "blocked": False,
-                        },
-                        plan["replayId"],
-                    )
-                for state in plan["states"]:
-                    self._apply_state(connection, state, plan["replayId"])
-                for trade in plan["trades"]:
-                    insert(connection, "trades", trade)
-                for slot, cash in plan["cash"].items():
-                    if (
-                        update(
-                            connection, "accounts", {"initial_cash": 10000.0, "cash": cash}, "slot=?", (slot,)
-                        ).rowcount
-                        != 1
-                    ):
-                        raise PredictionError("回放账户缺失")
-                for chain in self.repo.rows("execution_chains"):
-                    values = {
-                        "allocation_policy": ALLOCATION_POLICY,
-                        "filled_slots": plan["filled"].get((chain["slot"], chain["trading_date"]), 0),
-                    }
-                    if chain["winner_run_id"]:
-                        values.update(
-                            status="completed",
-                            stop_reason="历史动态仓位重放完成",
-                            completed_at=chain["completed_at"] or stamp(plan["started"]),
-                        )
-                    update(connection, "execution_chains", values, "chain_id=?", (chain["chain_id"],))
-                self._ledger(connection, plan)
-                insert(
-                    connection,
-                    "allocation_replays",
-                    {
-                        "replay_id": plan["replayId"],
-                        "policy_version": POLICY,
-                        "plan_hash": plan["hash"],
-                        "status": "complete",
-                        "candidate_count": result["candidateCount"],
-                        "buy_count": result["buyCount"],
-                        "sell_count": result["sellCount"],
-                        "missing_buy_count": result["missingBuyCount"],
-                        "missing_sell_count": result["missingSellCount"],
-                        "summary_json": json_text(result),
-                        "started_at": stamp(plan["started"]),
-                        "completed_at": stamp(plan["started"]),
-                    },
-                )
-        result["performance"] = HistoryService(self.repo, self.market).backfill()
         return result
-
-    def _apply_state(self, connection, state, replay_id):
-        values = {
-            "status": state["status"],
-            "failure_reason": state["reason"],
-            "historical_replay_id": replay_id,
-            "historical_sell_blocked": state["blocked"],
-            "baseline_value": None,
-            "period_pn_l": None,
-            "buy_at": None,
-            "buy_market_price": 0.0,
-            "buy_price": 0.0,
-            "quantity": 0,
-            "buy_fees": 0.0,
-            "current_price": 0.0,
-            "current_price_at": None,
-            "target_sell_at": None,
-            "sell_at": None,
-            "sell_market_price": 0.0,
-            "sell_price": 0.0,
-            "sell_fees": 0.0,
-            "net_pn_l": 0.0,
-            "net_yield_rate": 0.0,
-            "execution_failure_code": state["failure"],
-            "execution_quote_price": 0.0,
-            "execution_quote_at": None,
-            "execution_limit_price": 0.0,
-            "execution_limit_distance_pct": None,
-            "buy_day_limit_outcome": "",
-            "buy_day_limit_status": "pending",
-            "buy_day_limit_evaluated_at": None,
-            "buy_day_limit_attempt_count": 0,
-            "buy_day_limit_source_json": "[]",
-            "buy_day_limit_failure_reason": "",
-        }
-        if quote := state.get("quote"):
-            values.update(
-                execution_quote_price=quote["price"],
-                execution_quote_at=stamp(quote["at"]),
-                execution_limit_price=quote["limit"],
-                execution_limit_distance_pct=quote["distance"],
-            )
-        if buy := state.get("buy"):
-            values.update(
-                buy_at=buy["traded_at"],
-                buy_market_price=buy["market_price"],
-                buy_price=buy["execution_price"],
-                quantity=buy["quantity"],
-                buy_fees=buy["commission"] + buy["transfer_fee"],
-                current_price=buy["market_price"],
-                current_price_at=buy["traded_at"],
-                target_sell_at=stamp(state["sellAt"]),
-            )
-            if sell := state.get("sell"):
-                pnl = sell["net_cash_flow"] + buy["net_cash_flow"]
-                values.update(
-                    sell_at=sell["traded_at"],
-                    sell_market_price=sell["market_price"],
-                    sell_price=sell["execution_price"],
-                    sell_fees=sell["commission"] + sell["stamp_duty"] + sell["transfer_fee"],
-                    current_price=sell["market_price"],
-                    current_price_at=sell["traded_at"],
-                    net_pn_l=pnl,
-                    net_yield_rate=pnl / (-buy["net_cash_flow"]),
-                )
-        update(
-            connection,
-            "recommendations",
-            values,
-            "recommendation_id=?",
-            (state["item"]["recommendation_id"],),
-        )
-
-    def _ledger(self, connection, plan):
-        events = [(local(row["effective_at"]), 0, row["event_id"], row) for row in plan["capital"]]
-        events.extend(
-            (local(row["traded_at"]), 1 if row["side"] == "sell" else 2, row["trade_id"], row)
-            for row in plan["trades"]
-        )
-        events.sort(key=lambda e: (e[0], e[1], e[2]))
-        cash = {slot: 0.0 for slot in SLOTS}
-        capital = dict(cash)
-        positions = {slot: {} for slot in SLOTS}
-        stock_codes = {s["item"]["recommendation_id"]: s["item"]["stock_code"] for s in plan["states"]}
-        for at, kind, identity, row in events:
-            slot = row["slot"]
-            if kind == 0:
-                cash[slot] += row["amount"]
-                capital[slot] += row["amount"]
-            else:
-                cash[slot] += row["net_cash_flow"]
-                if kind == 2:
-                    positions[slot][row["recommendation_id"]] = row
-                else:
-                    positions[slot].pop(row["recommendation_id"], None)
-            if cash[slot] < -1e-7:
-                raise PredictionError("回放账本发生现金透支")
-            value = sum(
-                trade_cost(stock_codes[key], trade["market_price"], trade["quantity"], "sell")[
-                    "net_cash_flow"
-                ]
-                for key, trade in positions[slot].items()
-            )
-            nav = cash[slot] + value
-            profit = nav - capital[slot]
-            insert(
-                connection,
-                "account_ledger_snapshots",
-                {
-                    "snapshot_id": ("capital-" if kind == 0 else "trade-") + identity,
-                    "slot": slot,
-                    "valued_at": stamp(at),
-                    "trading_date": at.date().isoformat(),
-                    "snapshot_type": row["event_type"] if kind == 0 else "trade",
-                    "cash": cash[slot],
-                    "position_value": value,
-                    "net_asset_value": nav,
-                    "cumulative_external_capital": capital[slot],
-                    "net_internal_transfer": 0.0,
-                    "net_profit": profit,
-                    "cumulative_capital_return": profit / capital[slot] if capital[slot] else 0.0,
-                    "valuation_basis": "capital_ledger_v1",
-                },
-            )

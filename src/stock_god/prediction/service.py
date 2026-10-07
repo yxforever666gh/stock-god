@@ -1,72 +1,48 @@
-"""Prediction task orchestration. Every entry captures independent provider settings."""
+"""BASE43 orchestration. Providers and settings are immutable task snapshots."""
 
 from __future__ import annotations
 
 import asyncio
 import copy
-import dataclasses
+import json
 import logging
 from contextlib import contextmanager
 from datetime import timedelta
 
-from .core import (
-    DEFAULT_SLOT,
-    SLOTS,
-    Conflict,
-    PredictionError,
-    continuous,
-    fresh_quote,
-    json_text,
-    local,
-    next_session,
-    positive,
-    slot_at,
-    slot_time,
-    stamp,
-    upper_limit,
-)
+from .base43 import Base43Models, feature_candidate
+from .core import DEFAULT_SLOT, Conflict, PredictionError, json_text, local, next_session, positive, stamp
 from .email import EmailService, queue_published
-from .evidence import PROMPT, build_prompt, parse_output, prepare, render_report, validate
-from .repository import Repository, day_count, ensure_chain, ledger_snapshot, many, one, update
+from .repository import Repository
 from .views import Views
 
 log = logging.getLogger(__name__)
 
 
-def as_record(value):
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return dataclasses.asdict(value)
-    return dict(value) if isinstance(value, dict) else vars(value)
-
-
 class PredictionService:
     def __init__(
-        self, database, market, settings, ai_factory, audit, *, clock=None, mailer=None, evidence_store=None
+        self,
+        database,
+        market,
+        settings,
+        ai_factory,
+        audit,
+        *,
+        clock=None,
+        mailer=None,
+        evidence_store=None,
+        auction_source=None,
+        models=None,
     ):
-        self.database, self.market, self.settings, self.ai_factory, self.audit = (
-            database,
-            market,
-            settings,
-            ai_factory,
-            audit,
-        )
+        self.database, self.market, self.settings, self.audit = database, market, settings, audit
         self.clock = clock or local
         self.repo = Repository(database, self.clock)
         self.views = Views(self.repo, lambda day: self.market.is_trading_day(day))
         self.email = EmailService(self.repo, settings, mailer)
-        self._trade_lock = asyncio.Lock()
-        self._metric_lock = asyncio.Lock()
-        self._tasks = {}
-        self._last_trade = None
+        self.models = models or Base43Models(database)
+        self.auction_source = auction_source
+        self._trade_lock, self._metric_lock = asyncio.Lock(), asyncio.Lock()
+        self._tasks, self._chart_locks, self._chart_cache = {}, {}, {}
         self._last_email = None
-        self._last_metric = None
-        self._chart_locks = {}
-        self._chart_cache = {}
-        self._non_trading_date = None
-        if evidence_store is None:
-            from .evidence_store import EvidenceStore
-
-            evidence_store = EvidenceStore(database)
         self.evidence_store = evidence_store
 
     def _snapshot(self):
@@ -83,531 +59,305 @@ class PredictionService:
         finally:
             market.close()
 
+    @contextmanager
+    def _source(self, config):
+        source = self.auction_source.with_settings(copy.deepcopy(config)) if self.auction_source else None
+        try:
+            yield source
+        finally:
+            if source is not None and hasattr(source, "close"):
+                source.close()
+
     def on_settings_changed(self, before, after):
-        before_config = before.config if hasattr(before, "config") else before
-        after_config = after.config if hasattr(after, "config") else after
-        if before_config.get("predictionAutoEnabled", True) and not after_config.get(
-            "predictionAutoEnabled", True
-        ):
-            now = stamp(self.clock())
-            with self.database.transaction() as connection:
-                update(
-                    connection,
-                    "analysis_runs",
-                    {"archive_reason": "自动策略已关闭，仅保留报告"},
-                    "status='running'",
-                )
-                update(
-                    connection,
-                    "execution_chains",
-                    {"status": "disabled", "completed_at": now, "stop_reason": "股票预测自动策略已关闭"},
-                    "status='running'",
-                )
-                update(
-                    connection,
-                    "recommendations",
-                    {"status": "analysis_only", "failure_reason": "自动策略已关闭，仅保留分析"},
-                    "status IN ('buy_pending','standby') AND buy_at IS NULL",
-                )
-        if not after_config.get("predictionEmailEnabled", False):
-            self.repo.set(
-                "email_deliveries",
-                {"status": "cancelled", "next_attempt_at": None, "last_error": "邮件开关已关闭"},
-                "status IN ('pending','retry_wait')",
+        config = after.config if hasattr(after, "config") else after
+        if not config.get("predictionAutoEnabled", True):
+            self._expire(local(self.clock()), False)
+
+    def _task(self, day, kind, status, payload=None, error=None):
+        with self.database.transaction() as con:
+            con.execute(
+                "INSERT INTO research2_base43_daily_tasks VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(trading_date,task_type) DO UPDATE SET status=excluded.status, "
+                "completed_at=excluded.completed_at,payload_json=excluded.payload_json,error=excluded.error",
+                (
+                    day,
+                    kind,
+                    status,
+                    stamp(self.clock()),
+                    stamp(self.clock()) if status != "running" else None,
+                    json_text(payload or {}),
+                    error,
+                ),
             )
 
-    async def analyze(self, scheduled_for=None, *, diagnostic=False, parent_run_id=None):
-        now = self.clock()
-        scheduled = local(scheduled_for or now)
-        snapshot = self._snapshot()
-        with self._provider(snapshot.config) as market:
-            if not diagnostic and (not slot_at(now) or now.date() != scheduled.date()):
-                raise Conflict("不在允许启动分析的上午窗口")
-            if not diagnostic and not snapshot.config.get("predictionAutoEnabled", True):
-                raise Conflict("股票预测自动策略已关闭")
-            if self._non_trading_date == scheduled.date() or not await asyncio.to_thread(
-                market.is_trading_day, scheduled
-            ):
-                self._non_trading_date = scheduled.date()
-                if parent_run_id:
-                    raise Conflict("非交易日不执行分析")
-                return None
-            trigger = (
-                "diagnostic"
-                if diagnostic
-                else "manual_rerun"
-                if parent_run_id
-                else "startup_recovery"
-                if (now - scheduled).total_seconds() >= 60
-                else "scheduled"
-            )
-            run, created = self.repo.claim_run(scheduled, trigger, parent_run_id or "")
-            if not created:
-                return self.views.run(run["run_id"])
-            identity = run["run_id"]
-            attempts = []
-            try:
-                self.audit.begin(identity)
-                evidence_id = self.evidence_store.begin(identity, now)
-                self.repo.set("analysis_runs", {"evidence_set_id": evidence_id}, "run_id=?", (identity,))
-                try:
-                    evidence = await asyncio.to_thread(
-                        market.collect_prediction_evidence,
-                        now,
-                        set(),
-                        float.fromhex("0x1.fffffffffffffp+1023"),
-                    )
-                except Exception as error:
-                    failed = copy.deepcopy(
-                        getattr(error, "evidence", None)
-                        or {
-                            "cutoffAt": stamp(now),
-                            "freezeAt": stamp(self.clock()),
-                            "documents": [],
-                            "candidates": [],
-                        }
-                    )
-                    failed["evidenceSetId"] = evidence_id
-                    failed = self.evidence_store.capture(identity, failed, error=error)
-                    self.repo.set(
-                        "analysis_runs",
-                        {
-                            "evidence_set_id": evidence_id,
-                            "evidence_cutoff_at": stamp(failed.get("cutoffAt") or now),
-                            "evidence_profile_version": failed.get("evidenceProfileVersion", ""),
-                            "source_status_json": failed.get("sourceStatusJson") or "[]",
-                        },
-                        "run_id=?",
-                        (identity,),
-                    )
-                    raise
-                evidence["evidenceSetId"] = evidence_id
-                evidence = self.evidence_store.capture(identity, evidence)
-                evidence = copy.deepcopy(evidence)
-                evidence.setdefault("cutoffAt", stamp(now))
-                evidence.setdefault("freezeAt", stamp(now))
-                evidence.setdefault(
-                    "windowStartAt",
-                    stamp(
-                        local(evidence["cutoffAt"]).replace(second=0, microsecond=0) - timedelta(minutes=5)
-                    ),
-                )
-                evidence.setdefault("windowEndAt", evidence["cutoffAt"])
-                evidence = await asyncio.to_thread(prepare, evidence, market)
-                values = {
-                    "evidence_cutoff_at": stamp(evidence["cutoffAt"]),
-                    "evidence_window_start_at": stamp(evidence["windowStartAt"]),
-                    "source_status_json": evidence.get("sourceStatusJson") or "[]",
-                    "evidence_coverage_pct": evidence.get("coveragePct", 0),
-                    "degraded": bool(evidence.get("degraded")),
-                    "evidence_set_id": evidence.get("evidenceSetId", ""),
-                    "evidence_profile_version": evidence.get("evidenceProfileVersion", ""),
-                }
-                run.update(values)
-                self.repo.set("analysis_runs", values, "run_id=?", (identity,))
-                output = {"conclusion": "没有满足当前数据约束的可评分标的。", "recommendations": []}
-                items = []
-                warnings = []
-                prompt = build_prompt(evidence)
-                client = self.ai_factory(copy.deepcopy(snapshot.models))
-                for sequence in range(1, 3) if evidence.get("candidates") else ():
-                    call_attempts = []
-
-                    def on_attempt(record, call_attempts=call_attempts):
-                        row = as_record(record)
-                        key = row.get("id") or row.get("ID")
-                        if key:
-                            attempts[:] = [
-                                item for item in attempts if (item.get("id") or item.get("ID")) != key
-                            ]
-                            call_attempts[:] = [
-                                item for item in call_attempts if (item.get("id") or item.get("ID")) != key
-                            ]
-                        attempts.append(row)
-                        call_attempts.append(row)
-                        self.repo.set(
-                            "analysis_runs",
-                            {"model_attempt_log_json": json_text(attempts)},
-                            "run_id=?",
-                            (identity,),
-                        )
-
-                    phase = "prediction_overnight_strength" + ("_repair" if sequence > 1 else "")
-                    result = None
-                    call_error = None
-                    prompt = self.audit.prepare_prompt(prompt)
-                    try:
-                        result = await client.complete(prompt=prompt, phase=phase, on_attempt=on_attempt)
-                    except Exception as error:
-                        call_error = error
-                        raise
-                    finally:
-                        final_attempts = (
-                            result.attempts if result is not None and result.attempts else call_attempts
-                        )
-                        self.audit.record(
-                            identity,
-                            phase,
-                            sequence,
-                            prompt,
-                            evidence,
-                            result,
-                            final_attempts,
-                            local(evidence["cutoffAt"]),
-                            PROMPT,
-                            repaired=sequence > 1,
-                            error=call_error,
-                        )
-                    assert result is not None
-                    run["provider_name"] = result.provider_name
-                    run["model_name"] = result.model
-                    if not call_attempts and result.attempts:
-                        attempts.extend(as_record(row) for row in result.attempts)
-                    run["model_attempt_log_json"] = json_text(attempts)
-                    try:
-                        output = parse_output(result.content)
-                        items, warnings = validate(identity, evidence, output)
-                    except (ValueError, TypeError) as error:
-                        if sequence == 2:
-                            raise PredictionError("大模型结构化输出无效：" + str(error)) from error
-                        warnings = [str(error)]
-                    if not warnings:
-                        break
-                    prompt = (
-                        build_prompt(evidence)
-                        + "\n# 上次输出纠正要求\n"
-                        + "；".join(warnings)
-                        + "\n请重新生成完整JSON结果，覆盖全部冻结候选。"
-                    )
-                run.update(
-                    status="success" if items else "no_recommendation",
-                    recommendation_count=len(items),
-                    failure_reason="" if items else str(output.get("conclusion") or "无有效推荐"),
-                )
-                self.repo.publish(
-                    run,
-                    items,
-                    lambda finalized, rows: render_report(finalized, rows, evidence, output, warnings),
-                    queue_published,
-                )
-                self.audit.complete(identity)
-            except asyncio.CancelledError:
-                self._fail(identity, "分析被中断")
-                raise
-            except Exception as error:
-                self._fail(identity, str(error))
-                raise
-            return self.views.run(identity)
-
-    def _fail(self, identity, reason):
-        self.repo.set(
-            "analysis_runs",
-            {"status": "failed", "generated_at": stamp(self.clock()), "failure_reason": reason},
-            "run_id=? AND persisted_at IS NULL",
-            (identity,),
-        )
-        self.audit.fail(identity, reason)
-        with self.database.transaction() as connection:
-            connection.execute(
-                "UPDATE research_evidence_sets SET status='failed',frozen_at=? WHERE owner_type='research2' AND owner_id=? AND status='collecting'",
-                (stamp(self.clock()), identity),
-            )
-
-    async def rerun(self, identity):
-        parent = self.repo.row("analysis_runs", "run_id=?", (identity,))
-        result = await self.analyze(local(parent["scheduled_for"]), parent_run_id=identity)
-        await self.process_trades()
-        return result
-
-    async def _sells(self, market, now):
-        for slot in SLOTS:
-            scheduled = slot_time(now, slot)
-            if now < scheduled:
-                continue
-            with self.database.transaction() as connection:
-                chain = ensure_chain(connection, slot, now)
-            if chain["sell_completed_at"]:
-                continue
-            items = self.repo.rows(
-                "recommendations",
-                "slot=? AND status IN ('active','sell_pending') AND julianday(buy_at)<julianday(?) AND historical_sell_blocked=0",
-                (slot, stamp(scheduled)),
-            )
-            for item in items:
-                try:
-                    quote = await asyncio.wait_for(
-                        asyncio.to_thread(market.quote, item["stock_code"]), timeout=5
-                    )
-                except (OSError, ValueError, RuntimeError):
-                    quote = {}
-                checked = self.clock()
-                if not continuous(checked):
-                    return
-                stale = not positive(quote.get("price")) or not fresh_quote(quote.get("asOf"), checked)
-                if stale:
-                    price = item["current_price"] or item["buy_market_price"] or item["buy_price"]
-                    quote = {
-                        "price": price,
-                        "asOf": item["current_price_at"] or item["buy_at"],
-                        "source": "stored_current_price"
-                        if item["current_price"]
-                        else "original_buy_market_price"
-                        if item["buy_market_price"]
-                        else "original_buy_execution_price",
-                    }
-                self.repo.sell(
-                    item["recommendation_id"],
-                    quote,
-                    checked,
-                    stale,
-                    "recovered_slot_sell"
-                    if (checked - scheduled).total_seconds() >= 60
-                    else "scheduled_slot_sell",
-                )
-            with self.database.transaction() as connection:
-                update(
-                    connection,
-                    "execution_chains",
-                    {"sell_completed_at": stamp(self.clock())},
-                    "chain_id=? AND sell_completed_at IS NULL",
-                    (chain["chain_id"],),
-                )
-                ledger_snapshot(
-                    connection, slot, self.clock(), "scheduled-sell-" + chain["chain_id"], "scheduled_sell"
-                )
-
-    def _expire(self, now, auto_enabled):
-        with self.database.transaction() as connection:
-            date = local(now).date().isoformat()
-            update(
-                connection,
-                "execution_chains",
-                {"status": "cutoff", "stop_reason": "原交易日执行窗口已截止", "completed_at": stamp(now)},
-                "status='running' AND (trading_date<? OR (trading_date=? AND ?))",
-                (date, date, local(now).hour * 60 + local(now).minute >= 690),
-            )
-            update(
-                connection,
-                "recommendations",
-                {"status": "analysis_only", "failure_reason": "信号交易日或上午买入窗口已截止"},
-                "status IN ('buy_pending','standby') AND (date(signal_at,'+8 hours')<? OR (date(signal_at,'+8 hours')=? AND ?))",
-                (date, date, local(now).hour * 60 + local(now).minute >= 690),
-            )
-        if not auto_enabled:
-            self.on_settings_changed(
-                {"predictionAutoEnabled": True},
-                {"predictionAutoEnabled": False, "predictionEmailEnabled": True},
-            )
+    def _task_done(self, day, kind):
+        with self.database.connection() as con:
+            row = con.execute(
+                "SELECT status FROM research2_base43_daily_tasks WHERE trading_date=? AND task_type=?",
+                (day, kind),
+            ).fetchone()
+        return row is not None and row[0] in ("success", "blocked", "failed")
 
     @staticmethod
-    def _buy_quote(market, item):
-        if item["late"] or (not item["buy_lower"] and not item["buy_upper"]):
-            return market.quote(item["stock_code"])
-        from .history import bar_time, valid_bar
+    def _previous(market, now):
+        for delta in range(1, 21):
+            at = now - timedelta(days=delta)
+            if market.is_trading_day(at):
+                return at.date().isoformat()
+        raise PredictionError("缺少前交易日")
 
-        target = local(item["target_buy_at"])
-        rows = market.bars(
-            item["stock_code"],
-            target - timedelta(minutes=1),
-            target + timedelta(minutes=2),
-            period="1m",
-            adjustment="none",
-        )
-        bar = next((row for row in rows if valid_bar(row) and bar_time(row) == target), None)
-        if bar is None:
-            raise PredictionError("历史目标分钟行情不可用")
-        price = bar["close"]
-        if bar.get("amount", 0) > 0 and bar.get("volume", 0) > 0:
-            average = bar["amount"] / bar["volume"]
-            if bar["low"] * 0.8 < average < bar["high"] * 1.2:
-                price = average
-        result = {"price": price, "asOf": stamp(target), "source": bar.get("source", ""), "preClose": 0}
-        try:
-            quote = market.quote(item["stock_code"])
-            if quote.get("asOf") and local(quote["asOf"]).replace(second=0, microsecond=0) == target.replace(
-                second=0, microsecond=0
-            ):
-                result.update(
-                    {
-                        key: quote[key]
-                        for key in ("preClose", "suspended", "limitUp", "limitDown")
-                        if key in quote
-                    }
-                )
-        except (OSError, ValueError, RuntimeError):
-            pass  # A legacy exact minute remains usable without a concurrent realtime quote.
-        return result
-
-    async def process_trades(self, now=None):
-        if self._trade_lock.locked():
+    async def prepare_day(self, now=None):
+        now = local(now or self.clock())
+        day = now.date().isoformat()
+        if self._task_done(day, "prepare"):
             return
-        async with self._trade_lock:
-            now = local(now or self.clock())
+        self._task(day, "prepare", "running")
+        try:
             snapshot = self._snapshot()
             with self._provider(snapshot.config) as market:
-                self._expire(now, snapshot.config.get("predictionAutoEnabled", True))
-                if not continuous(now) or not await asyncio.to_thread(market.is_trading_day, now):
+                if not await asyncio.to_thread(market.is_trading_day, now):
+                    self._task(day, "prepare", "blocked", error="非交易日")
                     return
-                await self._sells(market, now)
-                if not snapshot.config.get("predictionAutoEnabled", True) or not slot_at(self.clock()):
-                    return
-                with self.database.connection() as connection:
-                    items = many(
-                        connection,
-                        "SELECT r.*,a.chain_id,a.generated_at run_generated FROM research2_recommendations r JOIN research2_analysis_runs a ON a.run_id=r.analysis_run_id WHERE a.status='success' AND r.status IN ('buy_pending','standby') AND julianday(r.target_buy_at)<=julianday(?) ORDER BY julianday(coalesce(a.generated_at,a.started_at)),r.final_score DESC,r.stock_code,r.id",
-                        (stamp(now),),
+                await asyncio.to_thread(self.models.prepare, day)
+                with self._source(snapshot.config) as source:
+                    if source:
+                        previous = await asyncio.to_thread(self._previous, market, now)
+                        await asyncio.to_thread(source.prepare, day, previous)
+            self._task(day, "prepare", "success")
+        except Exception:
+            self._task(day, "prepare", "failed", error="BASE43盘前准备失败")
+            log.error("BASE43 preparation failed; provider details suppressed")
+
+    async def analyze(self, scheduled_for=None, *, diagnostic=False, parent_run_id=None):
+        now = local(self.clock())
+        scheduled = local(scheduled_for or now)
+        if diagnostic or parent_run_id:
+            raise Conflict("BASE43不支持旧AI重跑或诊断交易入口")
+        if not (9, 29, 55) <= (now.hour, now.minute, now.second) <= (9, 29, 59):
+            raise Conflict("不在BASE43盘前冻结窗口")
+        day = scheduled.date().isoformat()
+        if self._task_done(day, "freeze"):
+            return None
+        snapshot = self._snapshot()
+        if not snapshot.config.get("predictionAutoEnabled", True):
+            raise Conflict("股票预测自动策略已关闭")
+        with self._source(snapshot.config) as source:
+            if source is None or not source.status().get("ready"):
+                self._task(day, "freeze", "blocked", error="竞价来源未配置或待核验，未执行选股")
+                raise Conflict("竞价来源未配置或待核验，未执行选股")
+            # Claim and freeze cash synchronously, before provider awaits.
+            run, created = self.repo.claim_run(scheduled)
+            if not created:
+                return self.views.run(run["run_id"])
+            self._task(day, "freeze", "running")
+            try:
+                with self._provider(snapshot.config) as market:
+                    if not await asyncio.to_thread(market.is_trading_day, now):
+                        raise Conflict("非交易日")
+                cutoff = min(now, now.replace(hour=9, minute=29, second=59, microsecond=0))
+                frozen = await asyncio.to_thread(source.freeze, day, cutoff)
+                if not frozen.get("complete"):
+                    raise Conflict("当日竞价母体或关键输入不完整，未执行选股")
+                model_snapshot = await asyncio.to_thread(self.models.snapshot, day)
+                if str(model_snapshot.dates[-1]) != day.replace("-", ""):
+                    raise Conflict("当日滚动模型未准备完成")
+                candidates, vectors = frozen.get("candidates", []), []
+                for candidate in candidates:
+                    for row in candidate.get("auctionRows", []):
+                        received = local(row["receivedAt"])
+                        if received > cutoff or received > now:
+                            raise Conflict("竞价证据越过冻结接收时点")
+                    vector = feature_candidate(candidate)
+                    if vector is None:
+                        raise Conflict("候选关键竞价证据不完整")
+                    vectors.append(vector)
+                    await asyncio.to_thread(
+                        self.models.record_candidate, day, candidate["code"], vector, candidate
                     )
-                groups = {}
-                for item in items:
-                    groups.setdefault(item["analysis_run_id"], []).append(item)
-                for group in groups.values():
-                    slot = group[0]["slot"]
-                    chain_id = group[0]["chain_id"]
-                    quotes = {}
-                    pending = set()
-                    valid = []
-                    for item in group:
+                scores = (
+                    await asyncio.to_thread(self.models.predict, vectors, model_snapshot) if vectors else []
+                )
+                items = [
+                    dict(stock_code=c["code"], stock_name=c.get("name", c["code"]), final_score=float(score))
+                    for c, score in zip(candidates, scores, strict=True)
+                ]
+                self.repo.set(
+                    "analysis_runs", {"evidence_cutoff_at": stamp(now)}, "run_id=?", (run["run_id"],)
+                )
+                run["evidence_cutoff_at"] = stamp(now)
+
+                def render(finalized, selected):
+                    lines = [
+                        "# BASE43 股票预测",
+                        f"交易日：{day}；冻结时点：{stamp(cutoff)}",
+                        "原43特征、五模型均值；正分前两名按盘前现金等分。",
+                        "模型日期：" + "、".join(model_snapshot.dates),
+                        "实时报价模拟成交；当前账户收益由成交账本计算，研究历史收益仅供参考。",
+                        "",
+                        "| 股票 | 预测净收益分数 | 席位预算 |",
+                        "|---|---:|---:|",
+                    ]
+                    lines.extend(
+                        f"| {row['stock_name']} {row['stock_code']} | {row['final_score']:.4f}% | {row['allocation_base_cash']:.2f}元 |"
+                        for row in selected
+                    )
+                    if not selected:
+                        lines.append("本日没有正分候选，保留现金。")
+                    return "\n".join(lines)
+
+                result = self.repo.publish_base43(run, items, render=render, queue_email=queue_published)
+                self._task(
+                    day,
+                    "freeze",
+                    "success",
+                    {
+                        "modelIdentity": model_snapshot.identity,
+                        "factsSha256": frozen.get("factsSha256"),
+                        "candidateCount": len(items),
+                    },
+                )
+                return self.views.run(result["run_id"])
+            except Exception:
+                self.repo.set(
+                    "analysis_runs",
+                    {
+                        "status": "failed",
+                        "failure_reason": "BASE43证据或模型未通过冻结校验",
+                        "generated_at": stamp(self.clock()),
+                    },
+                    "run_id=? AND persisted_at IS NULL",
+                    (run["run_id"],),
+                )
+                self._task(day, "freeze", "failed", error="BASE43证据或模型未通过冻结校验")
+                log.error("BASE43 freeze failed; provider details suppressed")
+                return None
+
+    async def rerun(self, identity):
+        raise Conflict("归档报告只读；BASE43不支持旧AI重跑")
+
+    def _expire(self, now, auto_enabled=True):
+        day = now.date().isoformat()
+        if (now.hour, now.minute) >= (9, 31) or not auto_enabled:
+            self.repo.set(
+                "recommendations",
+                {"status": "analysis_only", "failure_reason": "买入窗口已截止或自动策略已关闭"},
+                "slot=? AND status='buy_pending'",
+                (DEFAULT_SLOT,),
+            )
+        else:
+            self.repo.set(
+                "recommendations",
+                {"status": "analysis_only", "failure_reason": "买入席位已过期"},
+                "slot=? AND status='buy_pending' AND date(target_buy_at,'+8 hours')<>?",
+                (DEFAULT_SLOT, day),
+            )
+
+    async def process_trades(self, now=None):
+        now = local(now or self.clock())
+        snapshot = self._snapshot()
+        self._expire(now, snapshot.config.get("predictionAutoEnabled", True))
+        if not (9, 30) <= (now.hour, now.minute) < (15, 0):
+            return
+        async with self._trade_lock:
+            with self._provider(snapshot.config) as market:
+                if not await asyncio.to_thread(market.is_trading_day, now):
+                    return
+                with self._source(snapshot.config) as source:
+                    if source is None:
+                        return
+                    day = now.date().isoformat()
+                    for item in self.repo.rows(
+                        "recommendations",
+                        "slot=? AND status IN ('active','sell_pending','buy_pending')",
+                        (DEFAULT_SLOT,),
+                    ):
                         try:
-                            quote = await asyncio.to_thread(self._buy_quote, market, item)
-                        except (OSError, ValueError, RuntimeError) as error:
-                            self.repo.mark_pending(
-                                item["recommendation_id"], "等待有效买入行情：" + str(error)
+                            buying = item["status"] == "buy_pending"
+                            if buying and (
+                                not snapshot.config.get("predictionAutoEnabled", True)
+                                or (now.hour, now.minute) != (9, 30)
+                            ):
+                                continue
+                            if not buying:
+                                bought = local(item["buy_at"])
+                                if now.date() <= bought.date():
+                                    continue
+                                first = await asyncio.to_thread(next_session, market, bought, DEFAULT_SLOT)
+                                due = first
+                                if now.date() == first.date():
+                                    state = await asyncio.to_thread(
+                                        source.exit_state, item["stock_code"], day, bought.date().isoformat()
+                                    )
+                                    if (
+                                        not state.get("complete")
+                                        or not positive(state.get("buyClose"))
+                                        or not positive(state.get("auctionPrice"))
+                                    ):
+                                        continue
+                                    if state["auctionPrice"] / state["buyClose"] - 1 < -0.03:
+                                        due = first.replace(hour=10, minute=30)
+                                else:
+                                    due = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                                self.repo.set(
+                                    "recommendations",
+                                    {"target_sell_at": stamp(due)},
+                                    "recommendation_id=? AND slot=?",
+                                    (item["recommendation_id"], DEFAULT_SLOT),
+                                )
+                                if now < due:
+                                    continue
+                            rules = await asyncio.to_thread(source.rules, item["stock_code"], day)
+                            if not rules.get("known") or rules.get("suspended") is not False:
+                                continue
+                            quote = dict(await asyncio.to_thread(market.quote, item["stock_code"]))
+                            actual = local(self.clock())
+                            quote.setdefault("receivedAt", stamp(actual))
+                            quote.update(
+                                suspended=False,
+                                upperLimit=rules.get("upper", 0) / 100,
+                                lowerLimit=rules.get("lower", 0) / 100,
                             )
-                            pending.add(item["recommendation_id"])
-                            valid.append(item)
+                            if buying:
+                                sell_at = await asyncio.to_thread(next_session, market, actual, DEFAULT_SLOT)
+                                self.repo.buy_base43(item["recommendation_id"], quote, sell_at, actual)
+                            else:
+                                self.repo.sell_base43(item["recommendation_id"], quote, actual)
+                        except (OSError, ValueError, RuntimeError):
                             continue
-                        checked = self.clock()
-                        if not slot_at(checked) or local(item["signal_at"]).date() != checked.date():
-                            self._expire(checked, True)
-                            break
-                        failure = (
-                            "suspended"
-                            if quote.get("suspended")
-                            else "limit_up"
-                            if quote.get("limitUp")
-                            else "limit_down"
-                            if quote.get("limitDown")
-                            else "invalid_price"
-                            if not positive(quote.get("price"))
-                            else ""
-                        )
-                        limit = upper_limit(quote.get("preClose", 0))
-                        distance = (limit - quote.get("price", 0)) / limit * 100 if limit else None
-                        if not failure and distance is not None and distance + 1e-9 < 1:
-                            failure = "near_limit_up"
-                        if failure:
-                            self.repo.set(
-                                "recommendations",
-                                {
-                                    "status": "missed_untradable",
-                                    "execution_failure_code": failure,
-                                    "failure_reason": "本报告跳过不可验证成交：" + failure,
-                                    "execution_quote_price": quote.get("price", 0),
-                                    "execution_quote_at": stamp(quote.get("asOf")),
-                                    "execution_limit_price": limit,
-                                    "execution_limit_distance_pct": distance,
-                                },
-                                "recommendation_id=? AND status IN ('buy_pending','standby')",
-                                (item["recommendation_id"],),
-                            )
-                            continue
-                        not_before = max(local(item["signal_at"]), local(item["target_buy_at"])).replace(
-                            microsecond=0
-                        )
-                        if (
-                            (bool(chain_id) and not positive(quote.get("preClose")))
-                            or not quote.get("asOf")
-                            or (
-                                (item["late"] or (not item["buy_lower"] and not item["buy_upper"]))
-                                and not fresh_quote(quote.get("asOf"), checked)
-                            )
-                            or local(quote["asOf"]) < not_before
-                        ):
-                            self.repo.mark_pending(
-                                item["recommendation_id"], "等待报告后的新行情与可验证前收盘价", quote
-                            )
-                            pending.add(item["recommendation_id"])
-                        else:
-                            quotes[item["recommendation_id"]] = quote
-                            self.repo.set(
-                                "recommendations",
-                                {
-                                    "execution_quote_price": quote["price"],
-                                    "execution_quote_at": stamp(quote["asOf"]),
-                                    "execution_limit_price": limit,
-                                    "execution_limit_distance_pct": distance,
-                                    "execution_failure_code": "",
-                                    "failure_reason": "",
-                                },
-                                "recommendation_id=?",
-                                (item["recommendation_id"],),
-                            )
-                        valid.append(item)
-                    reserved = 0
-                    for item in valid:
-                        with self.database.connection() as connection:
-                            remaining = 5 - day_count(connection, slot, now.date().isoformat())
-                        if remaining <= reserved:
-                            break
-                        if item["recommendation_id"] in pending:
-                            reserved += 1
-                            continue
-                        quote = quotes[item["recommendation_id"]]
-                        sell_at = await asyncio.to_thread(
-                            next_session, market, local(item["target_buy_at"]), slot
-                        )
-                        current = item["late"] or (not item["buy_lower"] and not item["buy_upper"])
-                        if current and not fresh_quote(quote["asOf"], self.clock()):
-                            self.repo.mark_pending(item["recommendation_id"], "其他候选采集期间行情已过期")
-                            reserved += 1
-                            continue
-                        try:
-                            self.repo.buy(item["recommendation_id"], quote, sell_at, current=bool(current))
-                        except Conflict as error:
-                            self.repo.set(
-                                "recommendations",
-                                {"status": "analysis_only", "failure_reason": str(error)},
-                                "recommendation_id=? AND status IN ('buy_pending','standby')",
-                                (item["recommendation_id"],),
-                            )
-                        except PredictionError as error:
-                            self.repo.set(
-                                "recommendations",
-                                {"status": "missed_cash", "failure_reason": str(error)},
-                                "recommendation_id=? AND status IN ('buy_pending','standby')",
-                                (item["recommendation_id"],),
-                            )
-                    if chain_id:
-                        self.repo.finish_chain(chain_id)
 
     async def refresh_quotes(self, items=None):
-        snapshot = self._snapshot()
-        with self._provider(snapshot.config) as market:
-            items = (
-                items
-                if items is not None
-                else self.repo.rows("recommendations", "status IN ('active','sell_pending')")
+        items = (
+            items
+            if items is not None
+            else self.repo.rows(
+                "recommendations", "slot=? AND status IN ('active','sell_pending')", (DEFAULT_SLOT,)
             )
-            gate = asyncio.Semaphore(6)
-
-            async def refresh(item):
-                if item["status"] not in ("active", "sell_pending"):
-                    return
-                async with gate:
-                    try:
-                        quote = await asyncio.to_thread(market.quote, item["stock_code"])
-                    except (OSError, ValueError, RuntimeError):
-                        return
-                    if not positive(quote.get("price")) or not quote.get("asOf") or not local(quote["asOf"]):
-                        return
+        )
+        items = [
+            i for i in items if i.get("slot") == DEFAULT_SLOT and i["status"] in ("active", "sell_pending")
+        ]
+        if not items:
+            return
+        with self._provider(self._snapshot().config) as market:
+            for item in items:
+                try:
+                    quote = await asyncio.to_thread(market.quote, item["stock_code"])
+                    now = local(self.clock())
+                    at = local(quote["asOf"])
+                    if (
+                        not positive(quote.get("price"))
+                        or at.date() != now.date()
+                        or not 0 <= (now - at).total_seconds() <= 60
+                    ):
+                        continue
                     self.repo.set(
                         "recommendations",
-                        {"current_price": quote["price"], "current_price_at": stamp(quote["asOf"])},
-                        "recommendation_id=? AND status IN ('active','sell_pending') AND (current_price_at IS NULL OR julianday(current_price_at)<julianday(?))",
-                        (item["recommendation_id"], stamp(quote["asOf"])),
+                        {"current_price": quote["price"], "current_price_at": stamp(at)},
+                        "recommendation_id=? AND slot=? AND status IN ('active','sell_pending') AND (current_price_at IS NULL OR julianday(current_price_at)<julianday(?))",
+                        (item["recommendation_id"], DEFAULT_SLOT, stamp(at)),
                     )
-
-            await asyncio.gather(*(refresh(item) for item in items))
+                except (OSError, ValueError, RuntimeError):
+                    continue
 
     def list_runs(self, *args, **kwargs):
         return self.views.runs(*args, **kwargs)
@@ -635,7 +385,38 @@ class PredictionService:
             return Views(self.repo, market.is_trading_day).portfolio(*args, **kwargs)
 
     def slots(self, now=None):
-        return self.views.slots(now)
+        result = self.views.slots(now)
+        with self._source(self._snapshot().config) as source:
+            status = (
+                source.status()
+                if source
+                else {
+                    "configured": False,
+                    "ready": False,
+                    "status": "unconfigured",
+                    "message": "竞价API未配置，未执行选股",
+                }
+            )
+            health = self.models.health()
+            at = local(now or self.clock())
+            day = at.date().isoformat()
+            current_ready = bool(health.get("ready")) and day.replace("-", "") in health.get("modelDates", [])
+            with self.database.connection() as con:
+                prepare = con.execute(
+                    "SELECT status FROM research2_base43_daily_tasks WHERE trading_date=? AND task_type='prepare'",
+                    (day,),
+                ).fetchone()
+            if prepare and prepare[0] == "failed":
+                current_ready = False
+            for row in result:
+                if row["slot"] == DEFAULT_SLOT:
+                    row.update(
+                        auctionSourceConfigured=status.get("configured", False),
+                        modelReady=current_ready,
+                        auctionSourceStatus=status.get("status", "unconfigured"),
+                        auctionSourceMessage=status.get("message", ""),
+                    )
+            return result
 
     async def deliver_emails(self, now=None):
         await self.email.process(self._snapshot().config)
@@ -643,27 +424,22 @@ class PredictionService:
     async def recover(self, now=None, *, resume=True):
         now = local(now or self.clock())
         self.repo.ready()
-        interrupted = self.repo.rows("analysis_runs", "status='running'")
-        for run in interrupted:
-            reason = "服务重启时发现上次分析未完成，已恢复为新的分析轮次"
-            self.repo.set(
-                "analysis_runs",
-                {"status": "failed", "generated_at": stamp(now), "failure_reason": reason},
-                "run_id=?",
-                (run["run_id"],),
-            )
-            with self.database.connection() as connection:
-                audit_state = one(
-                    connection,
-                    "SELECT status FROM research_audit_run_states WHERE owner_type='research2' AND owner_id=?",
-                    (run["run_id"],),
-                )
-            if audit_state and audit_state["status"] == "capturing":
-                self.audit.fail(run["run_id"], reason)
-        with self.database.transaction() as connection:
-            connection.execute(
-                "UPDATE research_evidence_sets SET status='failed',frozen_at=? WHERE owner_type='research2' AND status='collecting' AND owner_id IN (SELECT run_id FROM research2_analysis_runs WHERE status='failed')",
-                (stamp(now),),
+        await asyncio.to_thread(self.models.bootstrap)
+        if not self.models.health().get("ready"):
+            raise RuntimeError("BASE43模型身份检查失败")
+        self.repo.set(
+            "analysis_runs",
+            {
+                "status": "failed",
+                "failure_reason": "BASE43冻结任务中断，不补发买单",
+                "generated_at": stamp(now),
+            },
+            "scheduled_slot=? AND status='running'",
+            (DEFAULT_SLOT,),
+        )
+        with self.database.transaction() as con:
+            con.execute(
+                "UPDATE research2_base43_daily_tasks SET status='failed',error='服务重启时任务中断' WHERE status='running' AND task_type NOT LIKE 'source%'"
             )
         self._expire(now, self._snapshot().config.get("predictionAutoEnabled", True))
         if resume:
@@ -676,41 +452,60 @@ class PredictionService:
         def done(completed):
             self._tasks.pop(key, None)
             if not completed.cancelled() and completed.exception():
-                log.error("prediction task %s failed: %s", key, completed.exception())
+                log.error("prediction task %s failed", key, exc_info=completed.exception())
 
         task.add_done_callback(done)
 
-    async def _scheduled_analysis(self, scheduled):
-        await self.analyze(scheduled)
-        await self.process_trades()
-        await self.deliver_emails()
+    async def _scheduled_freeze(self, now):
+        try:
+            await self.analyze(now)
+        except Conflict:
+            pass  # The durable blocked receipt is the business state, not a fake report.
+
+    async def _poll(self, now):
+        with self._source(self._snapshot().config) as source:
+            if source:
+                holdings = self.repo.rows(
+                    "recommendations", "slot=? AND status IN ('active','sell_pending')", (DEFAULT_SLOT,)
+                )
+                await asyncio.to_thread(
+                    source.poll, now.date().isoformat(), now, [r["stock_code"] for r in holdings]
+                )
 
     async def tick(self, now=None):
         now = local(now or self.clock())
-        slot = slot_at(now)
-        snapshot = self._snapshot()
-        pulse = now.replace(second=0 if now.second < 5 else 5, microsecond=0)
-        new_pulse = pulse != self._last_trade
-        if (
-            slot
-            and now.weekday() < 5
-            and self._non_trading_date != now.date()
-            and snapshot.config.get("predictionAutoEnabled", True)
-            and new_pulse
-        ):
-            key = now.date().isoformat() + ":" + slot
-            if key not in self._tasks:
-                self._launch(key, self._scheduled_analysis(slot_time(now, slot)))
-        if new_pulse and now.weekday() < 5 and 9 <= now.hour <= 15 and "trades" not in self._tasks:
-            self._last_trade = pulse
+        day = now.date().isoformat()
+        enabled = self._snapshot().config.get("predictionAutoEnabled", True)
+        if now.weekday() < 5:
+            if (
+                (9, 0) <= (now.hour, now.minute) < (9, 15)
+                and not self._task_done(day, "prepare")
+                and "prepare" not in self._tasks
+            ):
+                self._launch("prepare", self.prepare_day(now))
+            if (9, 15) <= (now.hour, now.minute) < (9, 30) and "poll" not in self._tasks:
+                self._launch("poll", self._poll(now))
+            if (
+                enabled
+                and (9, 29, 55) <= (now.hour, now.minute, now.second) <= (9, 29, 59)
+                and "freeze" not in self._tasks
+                and not self._task_done(day, "freeze")
+            ):
+                self._launch("freeze", self._scheduled_freeze(now))
+
+            if (
+                (now.hour, now.minute) >= (15, 5)
+                and "metrics" not in self._tasks
+                and not self._task_done(day, "close")
+            ):
+                self._launch("metrics", self.finalize_metrics(now))
+        if now.weekday() < 5 and (9, 30) <= (now.hour, now.minute) < (15, 0) and "trades" not in self._tasks:
             self._launch("trades", self.process_trades(now))
+        self._expire(now, enabled)
         if self._last_email is None or (now - self._last_email).total_seconds() >= 30:
             self._last_email = now
             if "email" not in self._tasks:
                 self._launch("email", self.deliver_emails(now))
-        if now.weekday() < 5 and (now.hour, now.minute) >= (15, 5) and self._last_metric != now.date():
-            self._last_metric = now.date()
-            self._launch("metrics", self.finalize_metrics(now))
 
     async def close(self):
         tasks = list(self._tasks.values())
@@ -720,29 +515,86 @@ class PredictionService:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def finalize_metrics(self, now=None):
+        from .base43_reference import (
+            ReferenceInputs,
+            reference_buy_terms,
+            reference_costs,
+            reference_sell_terms,
+        )
         from .history import HistoryService
 
-        async with self._metric_lock:
-            with self._provider(self._snapshot().config) as market:
-                return await asyncio.to_thread(
-                    HistoryService(self.repo, market).backfill, local(now or self.clock()).date().isoformat()
-                )
+        now = local(now or self.clock())
+        day = now.date().isoformat()
+        self._task(day, "close", "running")
+        try:
+            async with self._metric_lock:
+                with self._provider(self._snapshot().config) as market:
+                    if not await asyncio.to_thread(market.is_trading_day, now):
+                        self._task(day, "close", "blocked")
+                        return
+                    with self._source(self._snapshot().config) as source:
+                        if source:
+                            with self.database.connection() as con:
+                                samples = con.execute(
+                                    "SELECT trade_date,evidence_json FROM research2_base43_samples WHERE label_status IN ('pending','unknown') AND trade_date<? ORDER BY trade_date,code",
+                                    (day.replace("-", ""),),
+                                ).fetchall()
+                            groups = {}
+                            for entry_day, raw in samples:
+                                candidate = json.loads(raw)
+                                if candidate.get("source") == "frozen_raw_roi" or not candidate.get("code"):
+                                    continue
+                                groups.setdefault(entry_day, []).append(candidate)
+                            for entry_day, candidates in groups.items():
+                                maturity = await asyncio.to_thread(
+                                    next_session, market, local(entry_day), DEFAULT_SLOT
+                                )
+                                if maturity.date() > now.date():
+                                    continue
+                                inputs = ReferenceInputs(
+                                    market, source, entry_day, maturity.date().isoformat(), candidates
+                                )
+                                await asyncio.to_thread(
+                                    self.models.mature_pending,
+                                    inputs,
+                                    entry_day,
+                                    maturity.date().isoformat(),
+                                    reference_costs,
+                                    reference_buy_terms,
+                                    reference_sell_terms,
+                                )
+                        following = await asyncio.to_thread(next_session, market, now, DEFAULT_SLOT)
+                        await asyncio.to_thread(self.models.prepare, following.date().isoformat())
+                        await asyncio.to_thread(
+                            HistoryService(
+                                self.repo, market, rules_provider=source.rules if source else None
+                            ).backfill,
+                            day,
+                        )
+            self._task(day, "close", "success")
+        except Exception:
+            self._task(day, "close", "failed", error="BASE43收盘训练或收益结算失败")
+            log.error("BASE43 close task failed; provider details suppressed")
 
     async def backfill_performance(self):
         from .history import HistoryService
 
         async with self._metric_lock:
             with self._provider(self._snapshot().config) as market:
-                return await asyncio.to_thread(HistoryService(self.repo, market).backfill)
+                with self._source(self._snapshot().config) as source:
+                    return await asyncio.to_thread(
+                        HistoryService(
+                            self.repo, market, rules_provider=source.rules if source else None
+                        ).backfill
+                    )
 
     async def replay_allocations(self, dry_run=True):
-        from .replay import AllocationReplay
-
-        async with self._trade_lock:
-            with self._provider(self._snapshot().config) as market:
-                return await asyncio.to_thread(AllocationReplay(self.repo, market).run, dry_run)
+        raise Conflict("旧账户已归档，禁止交易重放")
 
     async def chart(self, identity, refresh=False):
+        item = self.repo.row("recommendations", "recommendation_id=?", (identity,))
+        if refresh and item["slot"] != DEFAULT_SLOT:
+            raise Conflict("归档图表仅支持只读查询")
         from .history import recommendation_chart
 
         lock = self._chart_locks.setdefault(identity, asyncio.Lock())

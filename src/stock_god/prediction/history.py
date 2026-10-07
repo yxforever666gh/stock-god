@@ -7,6 +7,7 @@ import math
 from datetime import timedelta
 
 from .core import (
+    DEFAULT_SLOT,
     SLOTS,
     PredictionError,
     dto,
@@ -66,8 +67,9 @@ def classify_outcome(item, data):
 
 
 class HistoryService:
-    def __init__(self, repository, market):
+    def __init__(self, repository, market, rules_provider=None):
         self.repo, self.market = repository, market
+        self.rules_provider = rules_provider
 
     def backfill(self, trading_date=""):
         result = {
@@ -77,7 +79,9 @@ class HistoryService:
             "valuationsCompleted": 0,
             "valuationsUnavailable": 0,
         }
-        items = self.repo.rows("recommendations", "buy_at IS NOT NULL", order="julianday(buy_at),id")
+        items = self.repo.rows(
+            "recommendations", "slot=? AND buy_at IS NOT NULL", (DEFAULT_SLOT,), order="julianday(buy_at),id"
+        )
         now = self.repo.clock()
         for item in items:
             bought = local(item["buy_at"])
@@ -133,7 +137,8 @@ class HistoryService:
         closes = {}
         for stock_code in sorted({item["stock_code"] for item in items}):
             try:
-                rows = self.market.daily_closes(stock_code, days[0], days[-1])
+                first_held = min(local(item["buy_at"]) for item in items if item["stock_code"] == stock_code)
+                rows = self.market.daily_closes(stock_code, min(days[0], first_held), days[-1])
             except (OSError, ValueError, RuntimeError):
                 rows = []
             closes[stock_code] = {row["tradingDate"]: row for row in rows if positive(row.get("close"))}
@@ -198,12 +203,36 @@ class HistoryService:
             for identity, trade in positions.items():
                 item = items[identity]
                 row = closes.get(item["stock_code"], {}).get(day.date().isoformat())
+                if not row and slot == DEFAULT_SLOT and self.rules_provider:
+                    try:
+                        rules = self.rules_provider(item["stock_code"], day)
+                    except (OSError, ValueError, RuntimeError):
+                        rules = {}
+                    prior = [
+                        (date, close)
+                        for date, close in closes.get(item["stock_code"], {}).items()
+                        if date < day.date().isoformat()
+                    ]
+                    previous_close = max(prior, default=("", {}))[1]
+                    if (
+                        rules.get("known") is True
+                        and rules.get("fullDaySuspended") is True
+                        and positive(previous_close.get("close"))
+                        and rules.get("reference") == round(previous_close["close"] * 100)
+                    ):
+                        row = dict(
+                            previous_close, source="verified-full-day-suspension:" + previous_close["source"]
+                        )
                 if not row:
                     reason = "missing unadjusted daily close for " + item["stock_code"]
                     break
-                value += trade_cost(item["stock_code"], row["close"], trade["quantity"], "sell")[
-                    "net_cash_flow"
-                ]
+                value += (
+                    row["close"] * trade["quantity"]
+                    if slot == DEFAULT_SLOT
+                    else trade_cost(item["stock_code"], row["close"], trade["quantity"], "sell")[
+                        "net_cash_flow"
+                    ]
+                )
                 sources[item["stock_code"]] = row["source"]
             nav = cash + value
             daily_return = None
@@ -250,7 +279,7 @@ class HistoryService:
                     insert(connection, "account_daily_valuations", row)
 
 
-def _returns(trades, stock_code, price, before=None):
+def _returns(trades, stock_code, price, before=None, *, market_value=False):
     buys = sells = 0.0
     quantity = 0
     for trade in trades:
@@ -264,7 +293,15 @@ def _returns(trades, stock_code, price, before=None):
             quantity -= trade["quantity"]
     if buys <= 0 or (quantity > 0 and not positive(price)):
         return 0.0, 0.0
-    value = sells + (trade_cost(stock_code, price, quantity, "sell")["net_cash_flow"] if quantity > 0 else 0)
+    value = sells + (
+        (
+            price * quantity
+            if market_value
+            else trade_cost(stock_code, price, quantity, "sell")["net_cash_flow"]
+        )
+        if quantity > 0
+        else 0
+    )
     return value - buys, (value - buys) / buys
 
 
@@ -272,6 +309,10 @@ def recommendation_chart(repository, market, identity, refresh):
     item = repository.row("recommendations", "recommendation_id=?", (identity,))
     trades = repository.rows("trades", "recommendation_id=?", (identity,), "julianday(traded_at),id")
     now = repository.clock()
+    account = repository.row("accounts", "slot=?", (item["slot"],))
+    if account.get("archived_at"):
+        now = min(local(now), local(account["archived_at"]))
+        refresh = False
     signal = local(item["signal_at"])
     anchor = min((local(trade["traded_at"]) for trade in trades if trade["side"] == "buy"), default=signal)
     start = anchor.replace(hour=9, minute=30, second=0, microsecond=0)
@@ -300,13 +341,16 @@ def recommendation_chart(repository, market, identity, refresh):
             opened_dates = snapshot["openedDates"]
             errors.extend(snapshot["errors"])
             try:
-                raw = market.cached_bars(
-                    item["stock_code"],
-                    start - timedelta(days=10),
-                    start - timedelta(minutes=1),
-                    period="1m",
-                    adjustment="none",
-                ) + raw
+                raw = (
+                    market.cached_bars(
+                        item["stock_code"],
+                        start - timedelta(days=10),
+                        start - timedelta(minutes=1),
+                        period="1m",
+                        adjustment="none",
+                    )
+                    + raw
+                )
             except (OSError, ValueError, RuntimeError):
                 pass  # Prior close is optional; refreshed holding-period bars remain usable.
         else:
@@ -323,9 +367,7 @@ def recommendation_chart(repository, market, identity, refresh):
                 )
             except (OSError, ValueError, RuntimeError) as cache_error:
                 errors.append({"provider": "minute-cache", "message": str(cache_error)})
-    all_bars = sorted(
-        {bar_time(bar): bar for bar in raw if valid_bar(bar)}.values(), key=bar_time
-    )
+    all_bars = sorted({bar_time(bar): bar for bar in raw if valid_bar(bar)}.values(), key=bar_time)
     bars = []
     for bar in all_bars:
         at = bar_time(bar)
@@ -336,6 +378,7 @@ def recommendation_chart(repository, market, identity, refresh):
             item["stock_code"],
             bar["close"],
             at.replace(second=0, microsecond=0) + timedelta(minutes=1),
+            market_value=item["slot"] == DEFAULT_SLOT,
         )
         bars.append(
             dict(
@@ -352,7 +395,11 @@ def recommendation_chart(repository, market, identity, refresh):
     previous = 0.0
     while day.date() <= end.date():
         try:
-            opened = day.weekday() < 5 if not refresh or weekday_fallback else day.date().isoformat() in opened_dates
+            opened = (
+                day.weekday() < 5
+                if not refresh or weekday_fallback
+                else day.date().isoformat() in opened_dates
+            )
         except (OSError, ValueError, RuntimeError) as error:
             opened = day.weekday() < 5
             errors.append({"provider": "calendar", "message": str(error)})
@@ -418,7 +465,7 @@ def recommendation_chart(repository, market, identity, refresh):
         )
     price = quote.get("price") or (bars[-1]["close"] if bars else item["current_price"] or 0)
     quoted = quote.get("asOf") or (bars[-1]["at"] if bars else item["current_price_at"])
-    pnl, rate = _returns(trades, item["stock_code"], price)
+    pnl, rate = _returns(trades, item["stock_code"], price, market_value=item["slot"] == DEFAULT_SLOT)
     return {
         "recommendationId": identity,
         "stockCode": item["stock_code"],

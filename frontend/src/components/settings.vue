@@ -34,6 +34,7 @@ const formValue = ref({
   openAI: {aiConfigs: []},
   experimentalEvidenceEnabled: false,
   predictionAutoEnabled: true,
+  meozApiKey: '',
   predictionEmail: {
     enabled: false,
     slots: [],
@@ -133,6 +134,7 @@ function applyConfigToForm(config) {
   formValue.value.openAI.aiConfigs = aiConfigs
   formValue.value.experimentalEvidenceEnabled = config?.experimentalEvidenceEnabled === true
   formValue.value.predictionAutoEnabled = config?.predictionAutoEnabled !== false
+  formValue.value.meozApiKey = config?.meozApiKey || ''
   formValue.value.predictionEmail = {
     enabled: config?.predictionEmailEnabled === true,
     slots: [...new Set((Array.isArray(config?.predictionEmailSlots) ? config.predictionEmailSlots : []).filter(validPredictionSlot))],
@@ -253,6 +255,7 @@ function buildConfigPayload() {
     privateMinuteLevel: formValue.value.privateMinute.level,
     experimentalEvidenceEnabled: formValue.value.experimentalEvidenceEnabled === true,
     predictionAutoEnabled: formValue.value.predictionAutoEnabled,
+    meozApiKey: formValue.value.meozApiKey,
     predictionEmailEnabled: formValue.value.predictionEmail.enabled,
     predictionEmailSlots: formValue.value.predictionEmail.slots,
     predictionEmailTo: formValue.value.predictionEmail.to,
@@ -457,7 +460,7 @@ onBeforeUnmount(() => {
     <n-form ref="formRef" :disabled="!settingsLoaded" label-placement="left" label-align="left" style="width: 100%">
       <n-space vertical size="large">
         <n-alert type="info" :show-icon="false">
-          股票预测设置。模型、数据接口和普通策略参数从下一轮任务生效；关闭自动策略后停止新分析和新买入，当前分析可完成报告，已有持仓继续按退出规则管理。
+          股票预测设置。策略参数从下一轮任务生效；关闭自动策略后停止新分析和新买入，当前分析可完成报告，已有持仓继续按退出规则管理。
         </n-alert>
         <n-card :title="() => h(NTag, {type: 'primary', bordered: false}, () => '通用设置')" size="small">
           <n-grid :cols="24" :x-gap="24">
@@ -505,30 +508,17 @@ onBeforeUnmount(() => {
           </n-grid>
         </n-card>
 
-        <n-card :title="() => h(NTag, {type: 'primary', bordered: false}, () => 'AI 分析设置')" size="small">
-          <n-grid :cols="24" :x-gap="24">
-            <n-form-item-gi :span="24" label="股票预测自动策略：" path="predictionAutoEnabled">
-              <n-switch v-model:value="formValue.predictionAutoEnabled" @update:value="handleImmediateFieldChange"/>
-              <n-text depth="3" style="margin-left: 12px">交易日09:30至11:25每五分钟独立研究，成功按落盘时间归入对应账户，先到先得并立即买入，每账户每天最多5只。各账户在对应刻度独立定时卖出旧持仓；关闭自动研究会停止新买入，已有持仓仍定时卖出。11:30后完成的报告仅归档。</n-text>
-            </n-form-item-gi>
-            <n-form-item-gi :span="24" label="实验市场证据：" path="experimentalEvidenceEnabled">
-              <n-switch v-model:value="formValue.experimentalEvidenceEnabled" @update:value="handleImmediateFieldChange"/>
-              <n-text depth="3" style="margin-left: 12px">默认关闭；为股票预测加入题材证据，下一轮任务生效，核心行情证据继续使用。</n-text>
-            </n-form-item-gi>
-            <n-gi :span="24">
-              <AiConfigSettings
-                  :form-value="formValue"
-                  :ai-protocol-options="aiProtocolOptions"
-                  :ai-config-row-key="aiConfigRowKey"
-                  :ai-config-test-state="aiConfigTestState"
-                  @immediate-change="handleImmediateFieldChange"
-                  @text-blur="handleTextFieldBlur"
-                  @add-ai-config="addAiConfig"
-                  @remove-ai-config="removeAiConfig"
-                  @test-ai-config="testAiConfig"
-                  @move-ai-config="handleAiConfigMove"/>
-            </n-gi>
-          </n-grid>
+        <n-card title="MeoZ 竞价数据" size="small">
+          <n-form-item label="Secret key：" path="meozApiKey">
+            <n-input v-model:value="formValue.meozApiKey" type="password" show-password-on="click" autocomplete="off" placeholder="输入 MeoZ secret key" @blur="handleTextFieldBlur"/>
+          </n-form-item>
+          <n-text depth="3">保存密钥后仍须通过竞价数据核验；鉴权失败、数据未核验或不完整时不执行新买入。</n-text>
+        </n-card>
+        <n-card title="BASE43 策略" size="small">
+          <n-form-item label="自动策略：" path="predictionAutoEnabled">
+            <n-switch v-model:value="formValue.predictionAutoEnabled" @update:value="handleImmediateFieldChange"/>
+          </n-form-item>
+          <n-text>每日滚动训练，原 43 特征与五模型均值；固定最多两只。竞价来源通过核验后才执行选股。关闭自动策略停止新选股与买入，已有持仓继续按退出规则管理。</n-text>
         </n-card>
 
         <n-card :title="() => h(NTag, {type: 'primary', bordered: false}, () => '股票预测报告邮件')" size="small">

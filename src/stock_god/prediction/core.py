@@ -10,11 +10,12 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-SLOTS = tuple(f"{minute // 60:02}:{minute % 60:02}" for minute in range(570, 690, 5))
-DEFAULT_SLOT = "09:50"
-TARGET_BUYS = 5
+LEGACY_SLOTS = tuple(f"{minute // 60:02}:{minute % 60:02}" for minute in range(570, 690, 5))
+SLOTS = ("base43",)
+DEFAULT_SLOT = "base43"
+TARGET_BUYS = 2
 ALLOCATION_POLICY = "remaining_cash_by_open_slots"
-STRATEGY_VERSION = "prediction-slots-v14"
+STRATEGY_VERSION = "base43-v1"
 
 
 class PredictionError(ValueError):
@@ -63,7 +64,7 @@ def stamp(value):
 
 
 def valid_slot(slot=DEFAULT_SLOT):
-    if slot not in SLOTS:
+    if slot not in SLOTS + LEGACY_SLOTS:
         raise PredictionError(f"无效股票预测时段：{slot}")
     return slot
 
@@ -75,7 +76,7 @@ def slot_at(at):
 
 
 def slot_time(at, slot):
-    hour, minute = map(int, valid_slot(slot).split(":"))
+    hour, minute = (9, 30) if valid_slot(slot) == DEFAULT_SLOT else map(int, slot.split(":"))
     return local(at).replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
@@ -121,6 +122,23 @@ def trade_cost(stock_code, price, quantity, side="buy") -> dict[str, float]:
         "slippage_amount": 0.0,
         "net_cash_flow": notional - fees if side == "sell" else -(notional + fees),
     }
+
+
+def base43_trade_cost(stock_code, price, quantity, side="buy"):
+    """Round each actually charged fee to cents; preserve archived fee semantics."""
+    from decimal import Decimal, ROUND_HALF_UP
+
+    result = trade_cost(stock_code, price, quantity, side)
+    notional = Decimal(str(price)) * quantity
+    cent = Decimal("0.01")
+    commission = max(Decimal("5"), notional * Decimal("0.0002"))
+    transfer = notional * Decimal("0.00001") if code(stock_code).startswith("sh") else Decimal(0)
+    duty = notional * Decimal("0.0005") if side == "sell" else Decimal(0)
+    fees = [fee.quantize(cent, rounding=ROUND_HALF_UP) for fee in (commission, transfer, duty)]
+    for key, fee in zip(("commission", "transfer_fee", "stamp_duty"), fees):
+        result[key] = float(fee)
+    result["net_cash_flow"] = float(notional - sum(fees) if side == "sell" else -(notional + sum(fees)))
+    return result
 
 
 def size_buy(stock_code, price, cash, slots, policy=ALLOCATION_POLICY, base=None):

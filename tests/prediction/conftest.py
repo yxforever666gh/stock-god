@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from stock_god.audit import AuditStore
-from stock_god.prediction.core import SLOTS, local, stamp
+from stock_god.prediction.core import LEGACY_SLOTS, local, stamp
 from stock_god.prediction.evidence_store import EvidenceStore
 from stock_god.prediction.repository import insert
 from stock_god.prediction.service import PredictionService
@@ -230,8 +230,8 @@ def env(tmp_path):
     audit = AuditStore(database)
     ai = AI(market)
     with database.transaction() as con:
-        for slot in SLOTS:
-            insert(con, "accounts", {"slot": slot, "initial_cash": 10000.0, "cash": 10000.0})
+        for slot in LEGACY_SLOTS:
+            insert(con, "accounts", {"slot": slot, "initial_cash": 10000.0, "cash": 10000.0, "archived_at": stamp(clock())})
             insert(
                 con,
                 "account_capital_events",
@@ -256,6 +256,7 @@ def env(tmp_path):
         mailer=lambda config, delivery: None,
         evidence_store=EvidenceStore(database, clock=clock),
     )
+    service.repo.ready()
     return SimpleNamespace(
         db=database, clock=clock, settings=settings, market=market, audit=audit, ai=ai, service=service
     )

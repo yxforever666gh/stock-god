@@ -11,7 +11,7 @@ from stock_god.storage.migrations import migrate, status, MANIFESTS
 def test_empty_upgrade_and_idempotence(tmp_path):
     main, minute = tmp_path / "main.db", tmp_path / "minute.db"
     result = migrate(main, minute)
-    assert result["main"]["currentVersion"] == 36
+    assert result["main"]["currentVersion"] == 37
     assert result["minute"]["currentVersion"] == 3
     with Database(main, read_only=True).connection() as db:
         assert db.execute("SELECT COUNT(*) FROM research2_accounts").fetchone()[0] == 24

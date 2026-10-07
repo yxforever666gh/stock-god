@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any
 
-from .core import DEFAULT_SLOT, SLOTS, PredictionError, dto, local, stamp, valid_slot
+from .core import DEFAULT_SLOT, SLOTS, LEGACY_SLOTS, PredictionError, dto, local, stamp, valid_slot
 from .repository import many, one, overview, recommendation_dto
 
 DAILY_SELECTION = """WITH selection_days AS (
@@ -80,7 +80,8 @@ class Views:
         self.repo, self.is_trading_day = repository, is_trading_day
 
     def trading_day_count(self, slot, from_date="", to_date=""):
-        today = local(self.repo.clock()).date()
+        account = self.repo.row("accounts", "slot=?", (slot,))
+        today = local(account.get("archived_at") or self.repo.clock()).date()
         lower = date.fromisoformat(from_date) if from_date else date.min
         upper = min(date.fromisoformat(to_date) if to_date else today, today)
         if lower > upper:
@@ -279,8 +280,8 @@ class Views:
             dict(
                 snapshotId="current-" + slot,
                 slot=slot,
-                valuedAt=stamp(self.repo.clock()),
-                tradingDate=self.repo.clock().date().isoformat(),
+                valuedAt=result["lastValuedAt"],
+                tradingDate=local(result["lastValuedAt"]).date().isoformat(),
                 snapshotType="current",
                 **{
                     key: result[key]
@@ -421,7 +422,10 @@ class Views:
         runs = {r["run_id"]: r for r in self.repo.rows("analysis_runs", "trading_date=?", (day,))}
         recommendations = self.repo.rows("recommendations")
         result = []
-        for slot in SLOTS:
+        accounts = {r["slot"]: r for r in self.repo.rows("accounts")}
+        for slot in SLOTS + LEGACY_SLOTS:
+            if slot not in accounts:
+                continue
             chain = chains.get(slot, {})
             run = runs.get(chain.get("winner_run_id"), {})
             report = (
@@ -443,7 +447,7 @@ class Views:
                 for r in recommendations
             )
             filled = chain.get("filled_slots", 0)
-            target = min(5, run.get("recommendation_count") or 5)
+            target = min(2 if slot == DEFAULT_SLOT else 5, run.get("recommendation_count") or (2 if slot == DEFAULT_SLOT else 5))
             status = chain.get("status", "awaiting")
             buy = (
                 status
@@ -465,11 +469,14 @@ class Views:
             result.append(
                 {
                     "slot": slot,
-                    "label": slot,
+                    "label": "BASE43" if slot == DEFAULT_SLOT else slot,
+                    "archivedAt": stamp(accounts[slot].get("archived_at")),
+                    "auctionSourceConfigured": False, "modelReady": False,
+                    "strategyVersion": "base43-v1" if slot == DEFAULT_SLOT else accounts[slot].get("strategy_version", "prediction-slots-v14"),
                     "tradingDate": day,
                     "winnerRunId": chain.get("winner_run_id", ""),
                     "sellCompletedAt": stamp(chain.get("sell_completed_at")),
-                    "status": status,
+                    "status": "archived" if slot != DEFAULT_SLOT else status,
                     "reportStatus": report,
                     "reportOnTime": bool(run["on_time"]) if run else None,
                     "buyStatus": buy,

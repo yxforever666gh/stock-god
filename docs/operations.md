@@ -73,6 +73,20 @@ pwsh -File scripts/verify.ps1 -Tier release
 
 ## 本地版本更新
 
+### 7.0.0 专项发布门禁
+
+BASE43 与 MeoZ 的离线实现不等同于已发布。先受控验证账号权限、字段与节点；再于真实交易日 09:15 前启动隔离采集，核验完整候选母体、09:20、09:24、09:24:50 检查点、最终竞价、数量单位、覆盖间隔及 09:29:59 前接收时间。首次实测仅验证，不写模拟买单。密钥只在进程内从文件读取，不进入请求文件、命令参数值、日志或 Git。
+
+```powershell
+.venv/Scripts/python.exe -m stock_god.meoz_validation --date <已核交易日> --key-file <密钥文件> --output H:/Download/stock-god-base43-acceptance
+```
+
+命令生成独立 UUID 目录、原始事实库及 `receipt.json`。成功后用 `--accept <该UUID目录> --key-file <密钥文件>` 只读复核；从干净提交执行 `pwsh -File scripts/update-local.ps1 -MeozAcceptance <该UUID目录> -MeozKeyFile <密钥文件>`。脚本在部署前重验原始事实，迁移 37 后、计划任务激活前保存密钥及同账号认证；失败沿既有双库回滚流程处理。
+
+无密钥、无权限或未完成开盘验收时停在待验收状态，不部署、不创建 7.0.0 tag、不推送。来源未配置本身不使整个服务拒绝就绪，但必须显示业务阻断状态，不能将 `/readyz` 成功当作实时选股验证。通过后才运行 `major`、版本同步、干净发布 checkout、快照、双库备份、迁移及计划任务激活；核对版本、commit、进程、模型及来源身份后创建 annotated tag 并原子推送 main 和 tag。
+
+旧 24 个账户归档后不再交易、估值或恢复写入；BASE43 初始本金 30,000 元只入账一次，重启不重复成交。收盘后滚动训练失败保持失败状态，次日不能冒用已更新标记；错过盘前冻结不补发买单。旧数据与回滚制品不得清理。
+
 代码和版本号提交后，从干净的 checkout 执行一次更新命令：
 
 ```powershell

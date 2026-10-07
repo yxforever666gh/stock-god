@@ -7,6 +7,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from .archive import ARCHIVE_DDL, create_archive_schema, seal_legacy_archive, verify_archive
+from .current import BASE43_ALTERS, BASE43_DDL, apply_base43_schema, extend_base43_shape
 from .db import Database
 from .db import quote_identifier as qi
 from .historical.common import now
@@ -23,7 +24,7 @@ STAGES = {
 }
 PUBLISHED_VERSIONS = json.loads((DATA_DIR / "published_versions.json").read_text(encoding="utf8"))
 UNVERSIONED_PROFILES = json.loads((DATA_DIR / "unversioned_profiles.json").read_text(encoding="utf8"))
-FINAL_VERSION = {"main": 36, "minute": 3}
+FINAL_VERSION = {"main": 37, "minute": 3}
 LEDGER_SQL = """CREATE TABLE IF NOT EXISTS schema_migrations (
 id INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
 applied_at DATETIME NOT NULL, app_version TEXT NOT NULL)"""
@@ -37,6 +38,18 @@ V36["checksum"] = sha256(
     f"000036\n{V36['name']}\n{V36['description']}\n{V36['definition']}".encode()
 ).hexdigest()
 MANIFESTS["main"].append(V36)
+V37 = dict(
+    id=37,
+    name="stock_god_base43_account_and_models",
+    description="Archive scheduled accounts without changing their financial records and persist BASE43 samples, model weights and daily task receipts.",
+    definition="\n".join(BASE43_ALTERS)
+    + "\nUPDATE research2_accounts SET archived_at=? WHERE slot GLOB '[0-2][0-9]:[0-5][0-9]' AND archived_at IS NULL;\n"
+    + "\n".join(BASE43_DDL),
+)
+V37["checksum"] = sha256(
+    f"000037\n{V37['name']}\n{V37['description']}\n{V37['definition']}".encode()
+).hexdigest()
+MANIFESTS["main"].append(V37)
 
 
 def _exists(db, name, kind="table"):
@@ -58,6 +71,8 @@ def _expected(kind, version):
         for obj in stage["objects"]:
             objects[obj["name"]] = obj
         columns.update(stage["columns"])
+    if kind == "main" and version >= 37:
+        extend_base43_shape(objects, columns)
     return objects, columns
 
 
@@ -444,6 +459,8 @@ def _migrate_one(path, kind):
             if version == 36:
                 create_archive_schema(db)
                 verify_archive(db)
+            elif kind == "main" and version == 37:
+                apply_base43_schema(db, now())
             else:
                 introduced = (
                     kind == "main"
@@ -459,7 +476,13 @@ def _migrate_one(path, kind):
                     apply_data(db, version, introduced_capital=introduced)
             db.execute(
                 "INSERT INTO schema_migrations(id,name,checksum,applied_at,app_version) VALUES(?,?,?,?,?)",
-                (version, migration["name"], migration["checksum"], now(), "6.0.0"),
+                (
+                    version,
+                    migration["name"],
+                    migration["checksum"],
+                    now(),
+                    "7.0.0" if kind == "main" and version == 37 else "6.0.0",
+                ),
             )
     return _status_one(path, kind, True)
 
@@ -489,7 +512,7 @@ def _status_one(path, kind, verify, *, allow_pending=False):
             result["quickCheck"] = "ok"
             if result["pending"] and not allow_pending:
                 raise ValueError("database has unapplied migrations")
-            objects, columns = _expected(kind, min(len(records), 35))
+            objects, columns = _expected(kind, len(records))
             for name, obj in objects.items():
                 if obj["type"] == "table":
                     if not _exists(db, name):
@@ -507,7 +530,7 @@ def _status_one(path, kind, verify, *, allow_pending=False):
                     if _normalize(actual_sql) != _normalize(obj["sql"]):
                         raise ValueError("schema object definition conflict: " + name)
             if kind == "main":
-                if len(records) == 36 and (
+                if len(records) >= 36 and (
                     not _exists(db, "legacy_archive_sets") or not _exists(db, "legacy_archive_tables")
                 ):
                     raise ValueError("schema 36 archive metadata is missing")

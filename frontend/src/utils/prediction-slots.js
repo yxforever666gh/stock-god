@@ -1,10 +1,13 @@
-export const PREDICTION_SLOTS = Array.from({length: 24}, (_, index) => {
+export const ARCHIVED_PREDICTION_SLOTS = Array.from({length: 24}, (_, index) => {
   const minute = 570 + index * 5
   const clock = value => `${String(Math.floor(value / 60)).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`
   return {value: clock(minute), label: `${clock(minute)}–${clock(minute + 5)}`}
 })
 
-export const validPredictionSlot = value => PREDICTION_SLOTS.some(slot => slot.value === value)
+export const PREDICTION_SLOTS = [{value: 'base43', label: 'BASE43'}]
+export const validPredictionSlot = value => [...PREDICTION_SLOTS, ...ARCHIVED_PREDICTION_SLOTS].some(slot => slot.value === value)
+
+export const auctionSourceLabels = {unconfigured: '竞价 API 未配置，未执行选股', unauthorized: '竞价 API 鉴权失败，未执行选股', unverified: '竞价数据尚未核验，未执行选股', ready: '竞价数据已核验', incomplete: '竞价数据不完整，未执行选股', error: '竞价数据获取失败，未执行选股'}
 
 const nonNegativeInteger = value => Math.max(0, Number.parseInt(value, 10) || 0)
 
@@ -12,6 +15,8 @@ export function predictionSlotBuyLabel(state = {}) {
   const bought = nonNegativeInteger(state?.boughtCount)
   const target = nonNegativeInteger(state?.buyTargetCount)
   const pending = nonNegativeInteger(state?.pendingBuyCount)
+  if (state?.archivedAt || state?.status === 'archived') return '归档账户，只读'
+  if (state?.slot === 'base43' && (state?.auctionSourceStatus !== 'ready' || !state?.auctionSourceConfigured)) return state?.auctionSourceMessage || auctionSourceLabels[state?.auctionSourceStatus] || auctionSourceLabels.unconfigured
   switch (state?.buyStatus) {
     case 'bought_full':
       return `买入：已买入 ${bought}/${target}`

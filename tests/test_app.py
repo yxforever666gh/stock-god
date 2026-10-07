@@ -18,6 +18,10 @@ from stock_god.storage.db import Database
 class OfflineMarket:
     def __init__(self):
         self.calls = []
+        self.meoz = SimpleNamespace(configured=False, status=lambda: {
+            "status": "unconfigured", "configured": False, "ready": False,
+            "message": "竞价 API 未配置，未执行选股",
+        })
 
     def with_settings(self, config):
         self.calls.append(copy.deepcopy(config))
@@ -50,7 +54,7 @@ def client(config, **kwargs):
     return TestClient(app, base_url="http://127.0.0.1:34115", client=("127.0.0.1", 45678), **kwargs)
 
 
-def test_cold_start_ready_static_and_all_24_accounts_without_network(app_config):
+def test_cold_start_ready_static_and_base43_with_archived_accounts_without_network(app_config):
     with client(app_config) as web:
         assert web.get("/livez").json() == {"ok": True}
         ready = web.get("/readyz")
@@ -60,11 +64,14 @@ def test_cold_start_ready_static_and_all_24_accounts_without_network(app_config)
         assert web.get("/api/v1/system/info").json()["version"] == APP_VERSION
         assert "Stock God" in web.get("/prediction").text
         assert web.get("/assets/missing.js").status_code == 404
-        assert len(web.get("/api/v1/prediction/slots").json()) == 24
+        assert len(web.get("/api/v1/prediction/slots").json()) == 25
+        active = web.get("/api/v1/prediction/account").json()
+        assert active["slot"] == "base43" and active["initialCash"] == 30000
         for hour, minute in [(9 + value // 60, value % 60) for value in range(30, 150, 5)]:
             response = web.get("/api/v1/prediction/account", params={"slot": f"{hour:02}:{minute:02}"})
             assert response.status_code == 200, response.text
-        assert len(web.app.state.market.calls) == 24  # Snapshots only; every provider operation fails above.
+        # Snapshot creation for source status is local; all network methods reject above.
+        assert all(not snapshot.get("meozApiKey") for snapshot in web.app.state.market.calls)
     assert not web.app.state.readiness["ready"]
 
 

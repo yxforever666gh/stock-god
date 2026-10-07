@@ -52,6 +52,26 @@ def test_deep_snapshot_and_compare_and_swap_preserve_other_owners(core_database)
         assert json.loads(raw)["research2AutoEnabled"] is False
 
 
+def test_meoz_key_snapshot_storage_and_redaction(core_database):
+    from stock_god.audit import redact_text
+
+    store = initialize(core_database)
+    first = store.load()
+    assert first.config["meozApiKey"] == ""
+    draft = first.payload()
+    draft["config"]["meozApiKey"] = "  fixture-meoz-key  "
+    draft["config"]["predictionEmailSlots"] = ["base43", "09:30"]
+    saved = store.save(first.revision, draft["config"], draft["aiConfigs"])
+    assert first.config["meozApiKey"] == ""
+    assert saved.config["meozApiKey"] == "fixture-meoz-key"
+    assert store.load().config["predictionEmailSlots"] == ["09:30", "base43"]
+    with pytest.raises(SettingsConflict):
+        store.save(first.revision, draft["config"], draft["aiConfigs"])
+    redacted, _ = redact_text(json.dumps(saved.config))
+    assert "fixture-meoz-key" not in redacted
+    assert json.loads(redacted)["meozApiKey"] == "[REDACTED]"
+
+
 def test_foreign_model_rolls_back_revision_and_deletion_archives(core_database):
     store = initialize(core_database)
     first = store.load()

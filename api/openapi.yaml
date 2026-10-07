@@ -827,7 +827,7 @@ paths:
       - name: slot
         in: query
         required: false
-        description: Five-minute account identity, e.g. 09:50; omitted reports include all slots
+        description: Account identity base43 is the active default; legacy HH:MM accounts are read-only archives
         schema: {type: string}
       description: Lists independent five-minute analysis attempts including archived late reports.
       responses:
@@ -960,7 +960,7 @@ paths:
       - name: slot
         in: query
         required: false
-        description: Five-minute account identity, e.g. 09:50; omitted reports include all slots
+        description: Account identity base43 is the active default; legacy HH:MM accounts are read-only archives
         schema: {type: string}
       - name: slots
         in: query
@@ -1030,7 +1030,7 @@ paths:
       - name: slot
         in: query
         required: false
-        description: Five-minute account identity, e.g. 09:50; omitted reports include all slots
+        description: Account identity base43 is the active default; legacy HH:MM accounts are read-only archives
         schema: {type: string}
       responses:
         '200':
@@ -1045,7 +1045,7 @@ paths:
       - name: slot
         in: query
         required: false
-        description: Five-minute account identity, e.g. 09:50; omitted reports include all slots
+        description: Account identity base43 is the active default; legacy HH:MM accounts are read-only archives
         schema: {type: string}
       responses:
         '200':
@@ -2103,6 +2103,12 @@ components:
       required: [slot, label, tradingDate, winnerRunId, status, reportStatus, buyStatus, boughtCount, buyTargetCount,
         pendingBuyCount, openPositionCount]
       properties:
+        archivedAt: {type: string, format: date-time, nullable: true}
+        auctionSourceStatus: {type: string, enum: [unconfigured, unauthorized, unverified, ready, incomplete, error]}
+        auctionSourceMessage: {type: string}
+        auctionSourceConfigured: {type: boolean}
+        modelReady: {type: boolean}
+        strategyVersion: {type: string}
         slot: {type: string}
         label: {type: string}
         tradingDate: {type: string, format: date}
@@ -2111,7 +2117,7 @@ components:
         status: {type: string}
         reportStatus:
           type: string
-          enum: [awaiting, success, no_recommendation, failed, cutoff, disabled]
+          enum: [awaiting, success, no_recommendation, failed, cutoff, disabled, unconfigured, archived]
         reportOnTime: {type: boolean, nullable: true, description: Whether the winning report persisted in its originally
             scheduled five-minute slot; null when no winning report exists.}
         buyStatus:
@@ -2460,6 +2466,12 @@ components:
         lastValuedAt, initialContribution, topUpContribution, cumulativeExternalCapital, netInternalTransfer, cumulativeCapitalReturn,
         valuationBasis]
       properties:
+        archivedAt: {type: string, format: date-time, nullable: true}
+        auctionSourceStatus: {type: string, enum: [unconfigured, unauthorized, unverified, ready, incomplete, error]}
+        auctionSourceMessage: {type: string}
+        auctionSourceConfigured: {type: boolean}
+        modelReady: {type: boolean}
+        strategyVersion: {type: string}
         slot: {type: string}
         baselineAt: {type: string, format: date-time, nullable: true}
         baselineNetAssetValue: {type: number}

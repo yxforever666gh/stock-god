@@ -52,4 +52,4 @@ def test_published_database_upgrades_directly_with_python(case, tmp_path):
     with Database(main).transaction() as db:
         load_published(db, case)
     result = migrate(main, tmp_path / "minute.db")
-    assert result["main"]["currentVersion"] == 36
+    assert result["main"]["currentVersion"] == 37

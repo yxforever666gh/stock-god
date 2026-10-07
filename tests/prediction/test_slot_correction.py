@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from stock_god.prediction.core import PredictionError
+from stock_god.prediction.core import Conflict, PredictionError
 from stock_god.prediction.repository import insert
 from stock_god.prediction.slot_correction import StartSlotCorrection, _restored_items
 
@@ -30,11 +30,10 @@ def test_start_slot_correction_selects_first_completion_and_excludes_1130(env):
     correction = StartSlotCorrection(env.service.repo, env.audit)
     plan = correction.plan()
     assert plan["winners"] == [(day, "09:55", "fast")]
-    assert correction.apply(plan, expected_hash=plan["planHash"])["restored"] == 0
-    assert correction.apply(plan, expected_hash=plan["planHash"])["reused"]
-    assert env.service.repo.row("analysis_runs", "run_id=?", ("slow",))["slot"] == "09:55"
-    assert not env.service.repo.row("analysis_runs", "run_id=?", ("late",))["published"]
-    assert env.service.repo.row("analysis_runs", "run_id=?", ("fast",))["published"]
+    before = env.service.repo.rows("analysis_runs")
+    with pytest.raises(Conflict, match="归档"):
+        correction.apply(plan, expected_hash=plan["planHash"])
+    assert env.service.repo.rows("analysis_runs") == before
 
 
 def test_old_strategy_restores_only_report_accepted_row_and_checks_price():

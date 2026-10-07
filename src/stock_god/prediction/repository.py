@@ -8,19 +8,17 @@ from datetime import timedelta
 from typing import Any, Literal, overload
 
 from .core import (
-    ALLOCATION_POLICY,
     DEFAULT_SLOT,
-    SLOTS,
     STRATEGY_VERSION,
     Conflict,
     NotFound,
     PredictionError,
     dto,
     local,
-    slot_at,
     slot_time,
     stamp,
     trade_cost,
+    base43_trade_cost,
     valid_slot,
 )
 
@@ -93,6 +91,9 @@ def insert(connection, table, values, *, ignore=False):
 
 
 def update(connection, table, values, where, params=()):
+    if table in {"recommendations", "accounts", "execution_chains", "account_ledger_snapshots", "account_daily_valuations"}:
+        for item in many(connection, f"SELECT slot FROM {TABLES[table]} WHERE {where}", params):
+            assert_active(connection, item["slot"])
     return connection.execute(
         f"UPDATE {TABLES[table]} SET {','.join(k + '=?' for k in values)} WHERE {where}",
         [*values.values(), *params],
@@ -117,7 +118,7 @@ def day_count(connection, slot, day):
 
 
 def ensure_chain(connection, slot, now):
-    valid_slot(slot)
+    assert_active(connection, valid_slot(slot))
     day = local(now).date().isoformat()
     chain_id = str(uuid.uuid5(uuid.NAMESPACE_OID, f"go-stock:research2:execution-chain:{day}:{slot}"))
     insert(
@@ -130,9 +131,9 @@ def ensure_chain(connection, slot, now):
             "scheduled_for": stamp(slot_time(now, slot)),
             "started_at": stamp(now),
             "status": "running",
-            "target_slots": 5,
+            "target_slots": 2,
             "filled_slots": day_count(connection, slot, day),
-            "allocation_policy": ALLOCATION_POLICY,
+            "allocation_policy": "base43_frozen_equal",
         },
         ignore=True,
     )
@@ -144,10 +145,44 @@ def ensure_chain(connection, slot, now):
     )
 
 
+def assert_active(connection, slot):
+    account = one(connection, "SELECT * FROM research2_accounts WHERE slot=?", (slot,), True)
+    if slot != DEFAULT_SLOT or account.get("archived_at"):
+        raise Conflict("旧预测账户已归档，只读")
+
+
+def validate_quote(quote, now, *, buy):
+    from .core import parse_time, positive
+    now = local(now)
+    at = parse_time(quote.get("asOf"))
+    received = parse_time(quote.get("receivedAt")) or now
+    if (at is None or at.date() != now.date() or at > received or received > now
+            or not 0 <= (now - at).total_seconds() <= 60 or not quote.get("source")
+            or not positive(quote.get("price")) or quote.get("suspended") is not False):
+        raise Conflict("缺少合格实时报价或停牌资格证据")
+    if buy:
+        cutoff = now.replace(hour=9, minute=31, second=0, microsecond=0)
+        opening = cutoff.replace(minute=30)
+        if not opening <= at <= now < cutoff:
+            raise Conflict("买入窗口已截止")
+        limit = quote.get("upperLimit")
+        if not positive(limit) or quote["price"] >= limit:
+            raise Conflict("涨停价未知或不可买入")
+    else:
+        limit = quote.get("lowerLimit")
+        minute = now.hour * 60 + now.minute
+        if not (570 <= minute < 690 or 780 <= minute < 900):
+            raise Conflict("连续交易窗口外")
+        if not positive(limit) or quote["price"] <= limit:
+            raise Conflict("跌停价未知或不可卖出")
+
+
 def live_value(item):
     price = item.get("current_price") or item.get("buy_market_price") or item.get("buy_price") or 0
     if price <= 0 or not item.get("quantity"):
         return 0.0
+    if item.get("slot") == DEFAULT_SLOT:
+        return price * item["quantity"]
     return trade_cost(item["stock_code"], price, item["quantity"], "sell")["net_cash_flow"]
 
 
@@ -195,7 +230,8 @@ def overview(connection, slot, at):
         "returnRate": profit / external,
         "openPositions": len(active),
         "pendingBuys": pending,
-        "lastValuedAt": stamp(at),
+        "lastValuedAt": stamp(account.get("archived_at") or at),
+        "archivedAt": stamp(account.get("archived_at")),
         "initialContribution": sum(
             r["amount"] for r in capital if r["external"] and r["event_type"] == "initial_external"
         ),
@@ -210,6 +246,7 @@ def overview(connection, slot, at):
 
 
 def ledger_snapshot(connection, slot, at, identity, kind="trade"):
+    assert_active(connection, slot)
     value = overview(connection, slot, at)
     row = {
         "snapshot_id": identity,
@@ -234,10 +271,21 @@ class Repository:
         self.db, self.clock = database, clock
 
     def ready(self):
-        with self.db.connection() as connection:
-            slots = {r[0] for r in connection.execute("SELECT slot FROM research2_accounts")}
-        if slots != set(SLOTS):
-            raise PredictionError("股票预测必须由迁移初始化24个独立账户")
+        now = self.clock()
+        with self.db.transaction() as connection:
+            insert(connection, "accounts", {
+                "slot": DEFAULT_SLOT, "initial_cash": 30000.0, "cash": 30000.0,
+                "baseline_at": stamp(now), "baseline_net_asset_value": 30000.0, "seed_cash": 30000.0,
+            }, ignore=True)
+            account = one(connection, "SELECT * FROM research2_accounts WHERE slot=?", (DEFAULT_SLOT,), True)
+            insert(connection, "account_capital_events", {
+                "event_id": "base43-initial-external", "slot": DEFAULT_SLOT,
+                "event_type": "initial_external", "amount": 30000.0, "external": True,
+                "source": "base43_initial_capital", "effective_at": account["baseline_at"] or stamp(now),
+                "trading_date": local(account["baseline_at"] or now).date().isoformat(),
+            }, ignore=True)
+            ledger_snapshot(connection, DEFAULT_SLOT, account["baseline_at"] or now,
+                            "base43-initial-external", "initial_external")
 
     def rows(self, table, where="1", params=(), order="id ASC"):
         with self.db.connection() as connection:
@@ -255,7 +303,7 @@ class Repository:
 
     def claim_run(self, scheduled, trigger="scheduled", parent=""):
         now = self.clock()
-        slot, day = slot_at(scheduled) or DEFAULT_SLOT, local(scheduled).date().isoformat()
+        slot, day = DEFAULT_SLOT, local(scheduled).date().isoformat()
         with self.db.transaction() as connection:
             runs = many(
                 connection,
@@ -273,15 +321,24 @@ class Repository:
                 raise Conflict("只允许重试最后一份失败报告")
             if runs and runs[0]["status"] != "failed":
                 return runs[0], False
+            now = local(self.clock())
+            cutoff = local(scheduled).replace(hour=9, minute=29, second=59, microsecond=0)
+            if now > cutoff or now.date().isoformat() != day:
+                raise Conflict("错过盘前冻结时点，禁止创建当日买入名单")
+            chain = ensure_chain(connection, DEFAULT_SLOT, now)
+            if chain["allocation_base_cash"] is None:
+                account = one(connection, "SELECT * FROM research2_accounts WHERE slot=?", (DEFAULT_SLOT,), True)
+                update(connection, "execution_chains", {"allocation_base_cash": account["cash"],
+                    "allocation_policy": "base43_frozen_equal"}, "chain_id=?", (chain["chain_id"],))
             run = {
                 "run_id": str(uuid.uuid4()),
                 "scheduled_slot": slot,
-                "slot": slot_at(now),
+                "slot": DEFAULT_SLOT,
                 "trading_date": day,
                 "attempt_no": (runs[0]["attempt_no"] + 1) if runs else 1,
                 "scheduled_for": stamp(scheduled),
                 "started_at": stamp(now),
-                "evidence_cutoff_at": stamp(now),
+                "evidence_cutoff_at": stamp(cutoff),
                 "evidence_window_start_at": stamp(
                     now.replace(second=0, microsecond=0) - timedelta(minutes=5)
                 ),
@@ -298,85 +355,7 @@ class Repository:
             ), True
 
     def publish(self, run, items, render, queue_email):
-        with self.db.transaction() as connection:
-            stored = one(
-                connection, "SELECT * FROM research2_analysis_runs WHERE run_id=?", (run["run_id"],), True
-            )
-            if stored["persisted_at"]:
-                return stored
-            now = self.clock()  # Sample only after BEGIN IMMEDIATE owns the publication lock.
-            started = local(stored["started_at"])
-            slot = slot_at(started)
-            completed_slot = slot_at(now)
-            run.update(
-                persisted_at=stamp(now),
-                generated_at=stamp(now),
-                slot=slot,
-                on_time=(
-                    slot == run["scheduled_slot"]
-                    and completed_slot == slot
-                    and started.date() == now.date()
-                ),
-                published=False,
-                chain_id="",
-                archive_reason="",
-            )
-            if run["trigger_source"] == "diagnostic":
-                run["archive_reason"] = "链路诊断，仅保留报告，不发布推荐或交易"
-            elif (
-                not slot
-                or not completed_slot
-                or started.date().isoformat() != run["trading_date"]
-                or local(now).date().isoformat() != run["trading_date"]
-            ):
-                run["archive_reason"] = "上午窗口外完成，仅保留报告"
-            else:
-                chain = ensure_chain(connection, slot, now)
-                reason = stored["archive_reason"] or (
-                    "本区间已有先落盘报告，仅保留报告" if chain["winner_run_id"] else ""
-                )
-                if not enabled(connection):
-                    reason = reason or "自动策略已关闭，仅保留报告"
-                run["archive_reason"] = reason
-                if not reason:
-                    changed = update(
-                        connection,
-                        "execution_chains",
-                        {
-                            "winner_run_id": run["run_id"],
-                            "latest_run_id": run["run_id"],
-                            "root_run_id": run["run_id"],
-                            "status": "running",
-                            "target_slots": 5,
-                            "allocation_policy": ALLOCATION_POLICY,
-                        },
-                        "chain_id=? AND coalesce(winner_run_id,'')=''",
-                        (chain["chain_id"],),
-                    ).rowcount
-                    if changed != 1:
-                        raise Conflict("时段报告已被其他任务发布")
-                    run.update(published=True, chain_id=chain["chain_id"], requested_slots=5)
-            for item in items:
-                item.update(
-                    slot=slot,
-                    signal_at=stamp(now),
-                    target_buy_at=stamp(now),
-                    status="buy_pending" if run["published"] else "analysis_only",
-                    failure_reason=run["archive_reason"],
-                )
-            run["report_markdown"] = render(run, items)
-            update(
-                connection,
-                "analysis_runs",
-                {k: v for k, v in run.items() if k != "id"},
-                "run_id=?",
-                (run["run_id"],),
-            )
-            if run["published"]:
-                for item in items:
-                    insert(connection, "recommendations", item)
-                queue_email(connection, run)
-            return dict(run)
+        return self.publish_base43(run, items, render, queue_email)
 
     def mark_pending(self, identity, reason, quote=None):
         values = {"failure_reason": reason, "execution_failure_code": "quote_retry"}
@@ -392,108 +371,7 @@ class Repository:
         )
 
     def buy(self, identity, quote, sell_at, *, current=True):
-        from .core import fresh_quote, size_buy
-
-        with self.db.transaction() as connection:
-            if not enabled(connection):
-                raise Conflict("自动策略已关闭")
-            item = one(
-                connection,
-                "SELECT * FROM research2_recommendations WHERE recommendation_id=? AND status IN ('buy_pending','standby')",
-                (identity,),
-                True,
-            )
-            now = self.clock()
-            if not slot_at(now) or local(item["signal_at"]).date() != local(now).date():
-                raise Conflict("上午买入窗口已截止")
-            if current and not fresh_quote(quote.get("asOf"), now):
-                raise Conflict("成交行情已过期")
-            day = local(now).date().isoformat()
-            slot = item["slot"]
-            filled = day_count(connection, slot, day)
-            if filled >= 5:
-                raise Conflict("已完成当日五笔买入")
-            duplicate = connection.execute(
-                "SELECT 1 FROM research2_recommendations WHERE slot=? AND stock_code=? AND (status IN ('active','sell_pending') OR date(buy_at,'+8 hours')=?)",
-                (slot, item["stock_code"], day),
-            ).fetchone()
-            if duplicate:
-                raise Conflict("该股票当日已买入或仍持仓")
-            run = one(
-                connection,
-                "SELECT * FROM research2_analysis_runs WHERE run_id=?",
-                (item["analysis_run_id"],),
-                True,
-            )
-            chain = (
-                one(
-                    connection,
-                    "SELECT * FROM research2_execution_chains WHERE chain_id=?",
-                    (run["chain_id"],),
-                )
-                if run["chain_id"]
-                else None
-            )
-            if chain and (
-                chain["status"] != "running"
-                or not chain["sell_completed_at"]
-                or chain["filled_slots"] >= chain["target_slots"]
-            ):
-                raise Conflict("执行链尚未完成卖出或已结束")
-            account = one(connection, "SELECT * FROM research2_accounts WHERE slot=?", (slot,), True)
-            quantity, cost = size_buy(
-                item["stock_code"],
-                quote["price"],
-                account["cash"],
-                5 - filled,
-                chain["allocation_policy"] if chain else ALLOCATION_POLICY,
-                chain["allocation_base_cash"] if chain else None,
-            )
-            trade: dict[str, Any] = dict(
-                trade_id=str(uuid.uuid4()),
-                recommendation_id=identity,
-                slot=slot,
-                side="buy",
-                traded_at=stamp(quote["asOf"]),
-                quote_at=stamp(quote["asOf"]),
-                market_price=quote["price"],
-                quantity=quantity,
-                price_source=quote.get("source", ""),
-                execution_mode="live_after_signal",
-                **cost,
-            )
-            update(
-                connection,
-                "recommendations",
-                {
-                    "status": "active",
-                    "buy_at": trade["traded_at"],
-                    "buy_market_price": quote["price"],
-                    "buy_price": cost["execution_price"],
-                    "quantity": quantity,
-                    "buy_fees": cost["commission"] + cost["transfer_fee"],
-                    "current_price": quote["price"],
-                    "current_price_at": trade["traded_at"],
-                    "target_sell_at": stamp(sell_at),
-                    "failure_reason": "",
-                    "execution_failure_code": "",
-                },
-                "recommendation_id=?",
-                (identity,),
-            )
-            insert(connection, "trades", trade)
-            update(
-                connection, "accounts", {"cash": account["cash"] + cost["net_cash_flow"]}, "slot=?", (slot,)
-            )
-            if chain:
-                values = {"filled_slots": filled + 1}
-                if filled + 1 >= 5:
-                    values.update(
-                        status="completed", stop_reason="已完成本区间当日五笔买入", completed_at=stamp(now)
-                    )
-                update(connection, "execution_chains", values, "chain_id=?", (chain["chain_id"],))
-            ledger_snapshot(connection, slot, local(trade["traded_at"]), "trade-" + trade["trade_id"])
-            return trade
+        return self.buy_base43(identity, quote, sell_at)
 
     def sell(self, identity, quote, at, stale=False, mode="scheduled_slot_sell"):
         with self.db.transaction() as connection:
@@ -504,7 +382,13 @@ class Repository:
             )
             if item is None:
                 return None
-            cost = trade_cost(item["stock_code"], quote["price"], item["quantity"], "sell")
+            assert_active(connection, item["slot"])
+            validate_quote(quote, at, buy=False)
+            if local(item["buy_at"]).date() >= local(at).date():
+                raise Conflict("T+1 未到")
+            if item.get("target_sell_at") and local(at) < local(item["target_sell_at"]):
+                raise Conflict("尚未到退出时间")
+            cost = base43_trade_cost(item["stock_code"], quote["price"], item["quantity"], "sell")
             paid = item["buy_price"] * item["quantity"] + item["buy_fees"]
             profit = cost["net_cash_flow"] - paid
             values = {
@@ -549,6 +433,7 @@ class Repository:
             chain = one(
                 connection, "SELECT * FROM research2_execution_chains WHERE chain_id=?", (chain_id,), True
             )
+            assert_active(connection, chain["slot"])
             count = day_count(connection, chain["slot"], chain["trading_date"])
             pending = connection.execute(
                 "SELECT count(*) FROM research2_recommendations r JOIN research2_analysis_runs a ON a.run_id=r.analysis_run_id WHERE a.chain_id=? AND r.status IN ('buy_pending','standby')",
@@ -570,3 +455,107 @@ class Repository:
                     (chain["winner_run_id"],),
                 )
             update(connection, "execution_chains", values, "chain_id=?", (chain_id,))
+
+    def publish_base43(self, run, candidates, render=None, queue_email=None):
+        from .core import code, positive
+        with self.db.transaction() as connection:
+            assert_active(connection, DEFAULT_SLOT)
+            stored = one(connection, "SELECT * FROM research2_analysis_runs WHERE run_id=?", (run["run_id"],), True)
+            if stored["scheduled_slot"] != DEFAULT_SLOT:
+                raise Conflict("旧预测报告已归档，只读")
+            if stored["persisted_at"]:
+                return stored
+            now = local(self.clock())
+            cutoff = now.replace(hour=9, minute=29, second=59, microsecond=0)
+            if (now >= cutoff.replace(hour=9, minute=31, second=0)
+                    or now.date().isoformat() != stored["trading_date"]
+                    or local(stored["started_at"]) > cutoff
+                    or not stored["evidence_cutoff_at"]
+                    or local(stored["evidence_cutoff_at"]) > cutoff):
+                raise Conflict("错过盘前冻结时点，禁止补发买单")
+            if not enabled(connection):
+                raise Conflict("自动策略已关闭")
+            # Select first, freeze equal budgets once; failed seats are never replaced.
+            chosen = sorted((dict(c) for c in candidates if positive(c.get("final_score", c.get("score")))),
+                            key=lambda c: (-c.get("final_score", c.get("score")), code(c["stock_code"])))[:2]
+            if len({code(c["stock_code"]) for c in chosen}) != len(chosen):
+                raise Conflict("候选代码重复")
+            chain = one(connection, "SELECT * FROM research2_execution_chains WHERE slot=? AND trading_date=?",
+                        (DEFAULT_SLOT, stored["trading_date"]), True)
+            if chain["allocation_base_cash"] is None or local(chain["started_at"]) > cutoff:
+                raise Conflict("没有盘前冻结预算，禁止借用当日卖款")
+            if chain["winner_run_id"]:
+                raise Conflict("当日已有冻结名单")
+            update(connection, "execution_chains", {
+                "winner_run_id": run["run_id"], "latest_run_id": run["run_id"], "root_run_id": run["run_id"],
+                "target_slots": len(chosen),
+                "allocation_policy": "base43_frozen_equal", "status": "running" if chosen else "completed",
+            }, "chain_id=?", (chain["chain_id"],))
+            budget = chain["allocation_base_cash"] / len(chosen) if chosen else 0
+            for rank, item in enumerate(chosen, 1):
+                item.update(recommendation_id=item.get("recommendation_id") or str(uuid.uuid4()),
+                    analysis_run_id=run["run_id"], stock_code=code(item["stock_code"]), slot=DEFAULT_SLOT,
+                    final_score=item.get("final_score", item.get("score")), status="buy_pending",
+                    signal_at=stamp(cutoff), target_buy_at=stamp(now.replace(hour=9, minute=30, second=0, microsecond=0)),
+                    allocation_base_cash=budget, allocation_policy="base43_frozen_equal", selection_rank=rank, selection_role="primary")
+                item.pop("score", None)
+                insert(connection, "recommendations", item)
+            values = {"status": "success" if chosen else "no_recommendation", "slot": DEFAULT_SLOT,
+                "published": True, "on_time": True, "persisted_at": stamp(now), "generated_at": stamp(now),
+                "chain_id": chain["chain_id"], "recommendation_count": len(chosen), "requested_slots": len(chosen),
+                "strategy_version": STRATEGY_VERSION}
+            run.update(values)
+            values["report_markdown"] = render(run, chosen) if render else "BASE43 固定前两名；模拟账户收益以实际报价成交账本为准。"
+            run["report_markdown"] = values["report_markdown"]
+            update(connection, "analysis_runs", values, "run_id=?", (run["run_id"],))
+            if queue_email:
+                queue_email(connection, run)
+            return one(connection, "SELECT * FROM research2_analysis_runs WHERE run_id=?", (run["run_id"],), True)
+
+    def buy_base43(self, identity, quote, sell_at, now=None):
+        import math
+        with self.db.transaction() as connection:
+            item = one(connection, "SELECT * FROM research2_recommendations WHERE recommendation_id=?", (identity,), True)
+            assert_active(connection, item["slot"])
+            if item["status"] == "active":
+                return one(connection, "SELECT * FROM research2_trades WHERE recommendation_id=? AND side='buy'", (identity,), True)
+            if item["status"] != "buy_pending" or not enabled(connection):
+                raise Conflict("买入席位不可执行")
+            now = local(now or self.clock())
+            if local(item["signal_at"]).date() != now.date():
+                raise Conflict("买入席位已过期")
+            validate_quote(quote, now, buy=True)
+            duplicate = connection.execute(
+                "SELECT 1 FROM research2_recommendations WHERE slot=? AND stock_code=? "
+                "AND recommendation_id<>? AND (status IN ('active','sell_pending') OR date(buy_at,'+8 hours')=?)",
+                (DEFAULT_SLOT, item["stock_code"], identity, now.date().isoformat()),
+            ).fetchone()
+            if duplicate:
+                raise Conflict("该股票当日已买入或仍持仓；冻结席位不补排")
+            account = one(connection, "SELECT * FROM research2_accounts WHERE slot=?", (DEFAULT_SLOT,), True)
+            cap = min(account["cash"], item["allocation_base_cash"] or 0)
+            quantity = math.floor(cap / quote["price"] / 100) * 100
+            while quantity > 0:
+                cost = base43_trade_cost(item["stock_code"], quote["price"], quantity)
+                if -cost["net_cash_flow"] <= cap + 1e-8:
+                    break
+                quantity -= 100
+            if quantity <= 0:
+                raise Conflict("冻结席位预算不足支付一手含费成本")
+            trade = dict(trade_id=str(uuid.uuid4()), recommendation_id=identity, slot=DEFAULT_SLOT, side="buy",
+                traded_at=stamp(now), quote_at=stamp(quote["asOf"]), market_price=quote["price"], quantity=quantity,
+                price_source=quote["source"], execution_mode="base43_live_quote", **cost)
+            update(connection, "recommendations", {"status": "active", "buy_at": stamp(now),
+                "buy_market_price": quote["price"], "buy_price": quote["price"], "quantity": quantity,
+                "buy_fees": cost["commission"] + cost["transfer_fee"], "current_price": quote["price"],
+                "current_price_at": stamp(quote["asOf"]), "target_sell_at": stamp(sell_at),
+                "failure_reason": "", "execution_failure_code": ""}, "recommendation_id=?", (identity,))
+            insert(connection, "trades", trade)
+            update(connection, "accounts", {"cash": account["cash"] + cost["net_cash_flow"]}, "slot=?", (DEFAULT_SLOT,))
+            run = one(connection, "SELECT * FROM research2_analysis_runs WHERE run_id=?", (item["analysis_run_id"],), True)
+            update(connection, "execution_chains", {"filled_slots": day_count(connection, DEFAULT_SLOT, now.date().isoformat())}, "chain_id=?", (run["chain_id"],))
+            ledger_snapshot(connection, DEFAULT_SLOT, now, "trade-" + trade["trade_id"])
+            return trade
+
+    def sell_base43(self, identity, quote, at):
+        return self.sell(identity, quote, at, mode="base43_live_quote")
