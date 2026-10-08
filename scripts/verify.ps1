@@ -17,7 +17,7 @@ function Invoke-Check([string]$Program, [string[]]$CommandArguments) {
 }
 Push-Location $projectDirectory
 try {
-    $paths = @($TestPath)
+    $paths = @($TestPath | Where-Object { $_ })
     if ($Domain) {
         $paths = switch ($Domain) {
             'prediction' { @('tests/prediction','tests/ai','tests/test_audit.py','tests/test_evidence_store.py','tests/test_settings.py') }

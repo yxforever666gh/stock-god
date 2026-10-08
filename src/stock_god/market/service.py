@@ -206,6 +206,22 @@ class MarketServices(Quotes, Charts, Evidence, News, PredictionInputs, TextAnaly
         self._refresh_session()
         return self.meoz.ticks(day, symbols, final=final, deadline=deadline, budget_seconds=budget_seconds)
 
+    def meoz_subscription_symbols(self, *, deadline=None):
+        from .meoz_stream import subscription_symbols
+        self._refresh_session()
+        return subscription_symbols(self.meoz, deadline=deadline)
+
+    def meoz_stream_records(self, symbols, *, deadline, on_status=None):
+        from .meoz_stream import stream_records
+        self._refresh_session()
+        return stream_records(self.meoz, symbols, deadline=deadline, on_status=on_status)
+
+    def meoz_tick_history(self, day, symbols, *, offset=0, start_time="09:15:00", end_time="09:26:00",
+                          deadline=None, budget_seconds=None):
+        self._refresh_session()
+        return self.meoz.tick_history(day, symbols, offset=offset, start_time=start_time, end_time=end_time,
+                                      deadline=deadline, budget_seconds=budget_seconds)
+
     def _auction_bars(self, code, start, end, budget_seconds):
         """Keep raw-minute provenance and cache coverage within one provider budget."""
         code, start, end = instrument(code)["code"], timestamp(start), timestamp(end)

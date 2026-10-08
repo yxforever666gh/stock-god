@@ -890,3 +890,11 @@ def test_failed_native_enumeration_still_closes_kill_on_close_job(tmp_path, monk
     with pytest.raises(OSError, match="kernel failure"):
         release.cleanup_spawn(child, job, record, tmp_path)
     assert not any(world.live.values())
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="PowerShell verification selector")
+def test_frontend_only_verification_does_not_select_an_empty_pytest_target():
+    source = (Path(__file__).parents[1] / "scripts/verify.ps1").read_text(encoding="utf-8-sig")
+    selection = next(line.strip() for line in source.splitlines() if line.strip().startswith("$paths = "))
+    command = "$TestPath=$null; " + selection + "; Write-Output $paths.Count"
+    result = subprocess.run(["pwsh", "-NoProfile", "-Command", command], check=True, capture_output=True, text=True)
+    assert result.stdout.strip() == "0"

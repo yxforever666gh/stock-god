@@ -81,17 +81,29 @@ class MeozProvider:
             raise ValueError("unsupported MeoZ interface")
         if history and apiname != "tick_history":
             raise ValueError("interface has no contracted MeoZ history service")
-        if not self.configured:
-            raise MeozError("unconfigured", "竞价 API 未配置")
-        body = {"apikey": self.settings["meozApiKey"], "apiname": apiname,
-                "params": deepcopy(params)}
+        body = {"apiname": apiname, "params": deepcopy(params)}
         if fields is not None:
             body["fields"] = fields
+        return self._post(apiname, body, params, fields, history=history, deadline=deadline,
+                          budget_seconds=budget_seconds)
+
+    def stream_ticket(self, symbols, *, deadline=None):
+        """Ticket URL remains in memory, never in evidence or telemetry."""
+        body = {"channel": "tick_stream", "stream_version": "tick_v1", "ttl_seconds": 120,
+                "symbols": [s[2:] + "." + s[:2].upper() for s in symbols]}
+        return self._post("ws-ticket", body, {}, deadline=deadline, budget_seconds=10)["ticket"]
+
+    def _post(self, apiname, body, params, fields=None, *, history=False, deadline=None, budget_seconds=None):
+        if not self.configured:
+            raise MeozError("unconfigured", "竞价 API 未配置")
+        body = {**body, "apikey": self.settings["meozApiKey"]}
         budget_end = None if budget_seconds is None else self.monotonic() + max(0.0, budget_seconds)
         node = self.node
         switched = False
         for attempt in range(3):
             url = HISTORY if history else LIVE[node]
+            if apiname == "ws-ticket":
+                url = url.removesuffix("/api") + "/api/v2/realtime/ws-ticket"
             timeout = self._remaining(deadline, budget_end)
             started_at, started = self.clock(), self.monotonic()
             outcome, row_count = "incomplete", 0
@@ -145,6 +157,14 @@ class MeozProvider:
                 else:
                     if response.status_code != 200 or code != 200:
                         raise MeozError("incomplete", "MeoZ 接口请求失败")
+                    if apiname == "ws-ticket":
+                        ticket = payload.get("data")
+                        if not isinstance(ticket, dict):
+                            raise MeozError("incomplete", "MeoZ 订阅票据结构无效")
+                        if not history:
+                            self.node = node
+                        outcome, row_count = "ok", 0
+                        return {"ticket": ticket}
                     rows, names = self._rows(payload.get("data"), params)
                 if not history:
                     self.node = node
@@ -226,6 +246,16 @@ class MeozProvider:
                                 "asOf": quote_time.isoformat(), "availableAt": received.isoformat(),
                                 "source": result["source"]})
         return records
+
+    def tick_history(self, day, symbols, *, offset=0, start_time="09:15:00", end_time="09:26:00",
+                     deadline=None, budget_seconds=None):
+        symbols = [instrument(s)["code"][2:] for s in symbols]
+        if not 0 < len(symbols) <= 200 or offset < 0:
+            raise ValueError("invalid MeoZ tick history batch")
+        return self.request("tick_history", {"asset": "stock", "symbols": symbols,
+            "tradedate": day.replace("-", ""), "start_time": start_time, "end_time": end_time,
+            "order_dir": "asc", "limit": 6000, "offset": offset}, TICK_FIELDS,
+            deadline=deadline, budget_seconds=budget_seconds)
 
     @staticmethod
     def auction_values(raw, reference_price, *, volume_unit=None):

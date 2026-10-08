@@ -1,21 +1,32 @@
 """Persisted causal auction collection, separate from prediction decisions."""
 
+import asyncio
 import hashlib
 import inspect
 import json
 import math
 import re
 import time
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from datetime import datetime, timedelta
-from threading import RLock
+from threading import Event, RLock
 from typing import Any
 
 from .common import CN, MarketDataError, instrument, number, timestamp
-from .meoz import MeozError, MeozProvider
+from .meoz import TICK_FIELDS, MeozError, MeozProvider
 
 SIGNATURE = "meoz-last-tick-1.0.4-book-lot-auction-lot-v1"
+
+# Internal resource limits, not user settings. Exhaustion fails coverage closed.
+_STREAM_BATCH = 1024
+_STREAM_SEEN = 4096
+_SNAPSHOT_RECORDS = 120000
+_SNAPSHOT_DOCUMENTS = 512
+_BACKFILL_PAGES = 100
+_BACKFILL_TOTAL_PAGES = 1000
+_TICK_NUMBERS = tuple(k for k in TICK_FIELDS.split(",")[3:] if k != "transaction_num")
 
 
 def _day(day):
@@ -56,12 +67,42 @@ class MeozAuctionSource:
         self.clock = clock or (lambda: datetime.now(CN))
         self._lock = RLock()
         self._timing_day = None
+        self._stream_event: Event | None = None
+        self._stream_day: str | None = None
+        self._stream_id = None
+        self._stream_guard, self._stream_registry_lock = RLock(), RLock()
+        self._stream_children = set()
+        self._stream_epoch = 0
 
     def with_settings(self, settings):
         return MeozAuctionSource(self.database, self.market.with_settings(deepcopy(settings)), self.clock)
 
     def close(self):
         self.market.close()
+
+    def revoke(self):
+        """Fence only active stream leases; ordinary source/poll contexts stay usable."""
+        with self._stream_registry_lock:
+            self._stream_epoch += 1
+            active = list(self._stream_children)
+        if self._stream_event is not None:
+            active.append((self._stream_event, self._stream_guard))
+        for event, _ in active:
+            event.set()
+        for _, guard in active:
+            with guard:
+                pass  # No pre-revocation transaction may commit after this returns.
+
+    def _check_stream_write(self, config=None):
+        if self._stream_event is None:
+            return
+        if self._stream_event.is_set():
+            raise MeozError("incomplete", "WS采集已撤销，旧任务写入已拒绝")
+        if self._stream_day and (self.clock().strftime("%Y%m%d") != self._stream_day
+                                or self.clock() >= self._deadline(self._stream_day)):
+            raise MeozError("incomplete", "WS采集窗口已截止，旧任务写入已拒绝")
+        if not (config or self.market.meoz.settings).get("predictionAutoEnabled", True):
+            raise MeozError("incomplete", "自动预测已关闭，旧WS采集写入已撤销")
 
     @property
     def configured(self):
@@ -83,23 +124,29 @@ class MeozAuctionSource:
 
     def _change(self, day, kind, change, status: str | None = "complete"):
         """Serialize only merging facts, and revoke stale credential writes atomically."""
-        with self.database.transaction() as db:
+        guard = self._stream_guard if self._stream_event is not None else nullcontext()
+        with guard, self.database.transaction() as db:
+            self._check_stream_write()
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='research_settings'").fetchone():
                 row = db.execute("SELECT config_json FROM research_settings WHERE center='research2'").fetchone()
-                key = json.loads(row[0]).get("meozApiKey", "").strip() if row else ""
+                config = json.loads(row[0]) if row else {}
+                key = config.get("meozApiKey", "").strip()
                 if hashlib.sha256(key.encode()).hexdigest() != self._key_fingerprint():
                     raise MeozError("incomplete", "API Key 已更换，旧采集写入已撤销")
+                self._check_stream_write(config)
             row = db.execute("SELECT payload_json FROM research2_base43_daily_tasks WHERE trading_date=? AND task_type=?",
                              (_day(day), kind)).fetchone()
             old = json.loads(row[0]) if row else {}
             if old.get("keyFingerprint") != self._key_fingerprint() or old.get("sourceSignature") != SIGNATURE:
                 old = {}
             payload = change(old)
+            self._check_stream_write()
             payload.update(keyFingerprint=self._key_fingerprint(), sourceSignature=SIGNATURE)
             status = status or ("complete" if payload.get("complete") else "waiting")
             now = self.clock().isoformat()
             db.execute("INSERT INTO research2_base43_daily_tasks VALUES (?,?,?,?,?,?,?) ON CONFLICT(trading_date,task_type) DO UPDATE SET status=excluded.status,completed_at=excluded.completed_at,payload_json=excluded.payload_json,error=excluded.error",
                        (_day(day), kind, status, now, now, _json(payload), payload.get("error")))
+            self._check_stream_write()
         return payload
 
     def _progress(self, day, change):
@@ -171,6 +218,23 @@ class MeozAuctionSource:
             else:
                 status["message"] += (f"；母体{mother_count}只，合格{len(eligible)}只"
                                       f"，历史完成{len(prepared.get('candidates', []))}/{len(eligible)}只")
+        stream = self._read(day, "source_stream") or {}
+        if stream:
+            status["message"] += (f"；WS {stream.get('state', 'waiting')}"
+                                  f"，全市场订阅{stream.get('confirmedCount', 0)}/{stream.get('selectedCount', 0)}"
+                                  f"，落盘范围{stream.get('persistedScopeCount', 0)}只")
+            if stream.get("slotLimit") is not None:
+                status["message"] += f"，槽位{stream['slotLimit']}"
+            if stream.get("stockCount") is not None:
+                status["message"] += f"，收到行情{int(stream['stockCount'])}只"
+            if stream.get("error"):
+                status["message"] += "，" + stream["error"]
+        backfill = self._read(day, "source_tick_backfill") or {}
+        if backfill:
+            status["message"] += (f"；全Tick补采{backfill.get('pages', 0)}页"
+                                  + ("已结束" if backfill.get("complete") else "待续"))
+            if backfill.get("error"):
+                status["message"] += "，" + backfill["error"]
         timing = self._read(day, "source_timing") or {}
         if timing.get("requestCount"):
             status["message"] += f"；请求累计{timing.get('requestElapsedSeconds', 0):.2f}秒"
@@ -515,6 +579,310 @@ class MeozAuctionSource:
         return {"complete": complete, "candidates": candidates, "documents": documents,
                 "sourceStatusJson": deepcopy(state)}
 
+    def _persistence_symbols(self, day, holding_symbols=()):
+        prepared = self._read(day, "source_candidates") or {}
+        return {instrument(s)["code"] for s in prepared.get("motherSymbols", [])} | {
+            instrument(s)["code"] for s in (prepared.get("progress", {}).get("eligibleSymbols") or [])} | {
+            c["code"] for c in prepared.get("candidates", [])} | {
+            instrument(s)["code"] for s in holding_symbols}
+
+    async def capture_stream(self, day, holding_symbols=()):
+        """Own a settings-scoped stream lease; subscription never expands model candidates."""
+        with self._stream_registry_lock:
+            epoch = self._stream_epoch
+        task = self.with_settings(deepcopy(self.market.meoz.settings))
+        event = Event()
+        task._stream_event, task._stream_day = event, _day(day)
+        task._stream_id = hashlib.sha256(f"{day}:{time.monotonic_ns()}".encode()).hexdigest()[:24]
+        completed = None
+        control = (event, task._stream_guard)
+        with self._stream_registry_lock:
+            if epoch != self._stream_epoch:
+                event.set()
+            self._stream_children.add(control)
+        try:
+            completed = await task._capture_stream(_day(day), tuple(holding_symbols))
+            return completed
+        finally:
+            event.set()
+            with self._stream_registry_lock:
+                self._stream_children.discard(control)
+            try:
+                await self._stream_work(self._stream_terminal, _day(day), task._stream_id, completed)
+            finally:
+                await self._stream_work(task.close)
+
+    def _stream_terminal(self, day, capture_id, completed):
+        """Post-cutoff health only; never relax quote writes or overwrite a new lease."""
+        def finish(saved):
+            if saved.get("captureId") != capture_id:
+                return saved
+            state = "closed" if self.clock() >= self._deadline(day) else "cancelled"
+            saved.update(state=state, endedAt=self.clock().isoformat(), complete=False)
+            if completed and completed.get("state") in {"failed", "disconnected"}:
+                saved["state"] = completed["state"]
+                saved["error"] = completed.get("error")
+            return saved
+        try:
+            saved = self._read(day, "source_stream") or {}
+            if saved.get("captureId") == capture_id:
+                self._change(day, "source_stream", finish, "complete")
+        except MeozError:
+            pass  # Replaced credentials cannot publish even terminal health.
+
+    @staticmethod
+    async def _stream_work(function, *args, **kwargs):
+        worker = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # Finish a bounded DB/provider worker before releasing its settings lease.
+            try:
+                await worker
+            except Exception:
+                pass
+            raise
+
+    async def _capture_stream(self, day, holding_symbols):
+        event = self._stream_event
+        assert event is not None
+        cutoff = self._deadline(day)
+        summary = {"state": "waiting", "captureId": self._stream_id, "selectedCount": 0, "confirmedCount": 0,
+                   "persistedScopeCount": 0, "counts": {}, "complete": False}
+        buffer, seen = [], OrderedDict()
+        scope, subscribed = set(), set()
+        last_flush = time.monotonic()
+        iterator, pending = None, None
+        flush_lock = asyncio.Lock()
+
+        def count(name, n=1):
+            counts = summary["counts"]
+            counts[name] = counts.get(name, 0) + n
+
+        async def flush(force=False):
+            nonlocal last_flush, scope
+            async with flush_lock:
+                if not force and time.monotonic() - last_flush < 1 and len(buffer) < _STREAM_BATCH:
+                    return
+                if buffer:
+                    saved = await self._stream_work(self._snapshot_merge, day, records=list(buffer))
+                    summary["counts"]["storedRecords"] = len(saved["records"])
+                    buffer.clear()
+                scope = await self._stream_work(self._persistence_symbols, day, holding_symbols)
+                summary["persistedScopeCount"] = len(scope)
+                summary["updatedAt"] = self.clock().isoformat()
+                await self._stream_work(self._write, day, "source_stream", deepcopy(summary),
+                    "failed" if summary["state"] == "failed" else "complete" if summary["complete"] else "waiting")
+                last_flush = time.monotonic()
+
+        async def on_status(value):
+            # Transport callbacks also persist health when no quotes are arriving.
+            old_state = summary["state"]
+            state = value.get("status", value.get("state"))
+            if state in {"connecting", "connected", "subscribed", "receiving", "disconnected", "retrying", "failed"}:
+                summary["state"] = state
+            summary["transportState"] = state
+            for name in ("selectedCount", "confirmedCount", "slotLimit"):
+                n = number(value.get(name))
+                if n is not None and n >= 0:
+                    summary[name] = int(n)
+            counts = value.get("counts")
+            if isinstance(counts, dict):
+                summary["transportCounts"] = {k: int(n) for k, v in counts.items()
+                                               if (n := number(v)) is not None and n >= 0}
+            for name in ("receivedCount", "stockCount", "attempts", "bookDivisor", "volumeDivisor"):
+                n = number(value.get(name))
+                if (n is not None and n >= 0) or (name in value and value[name] is None):
+                    summary[name] = n
+                    summary.setdefault("transportCounts", {})[name] = n
+            health = value.get("fullstockHealth", value.get("stockHealth"))
+            if isinstance(health, dict):
+                summary["fullstockHealth"] = {code: {k: v for k, v in row.items()
+                    if k in {"count", "firstAsOf", "lastAsOf", "maxGapSeconds"}}
+                    for code, row in health.items() if code in subscribed and isinstance(row, dict)}
+            await flush(force=old_state != summary["state"])
+
+        try:
+            previous = await self._stream_work(self._read, day, "source_stream") or {}
+            summary["counts"] = deepcopy(previous.get("counts", {}))
+            now = timestamp(self.clock())
+            if now.strftime("%Y%m%d") != day or now >= cutoff:
+                summary.update(state="missed_window", error="WS采集窗口已截止")
+                await flush(True)
+                return summary
+            if not self.configured:
+                raise MeozError("unconfigured", "竞价 API 未配置")
+            await flush(True)  # Check live auto/key guards before any preparation/provider request.
+            prepared = await self._stream_work(self._read, day, "source_candidates") or {}
+            if "motherSymbols" not in prepared and not prepared.get("complete"):
+                try:
+                    await self._stream_work(self.collect_mother, day)
+                except (MeozError, MarketDataError) as exc:
+                    summary["motherError"] = str(exc)
+            selected = await self._stream_work(self.market.meoz_subscription_symbols, deadline=cutoff)
+            symbols = sorted({instrument(s)["code"] for s in selected})
+            subscribed = set(symbols)
+            summary["selectedCount"] = len(symbols)
+            await flush(True)
+            if not symbols:
+                raise MeozError("incomplete", "全市场订阅范围为空")
+            iterator = self.market.meoz_stream_records(symbols, deadline=cutoff, on_status=on_status).__aiter__()
+            while timestamp(self.clock()) < cutoff and not event.is_set():
+                if pending is None:
+                    pending = asyncio.create_task(anext(iterator))
+                wait = min(1.0, max(0.0, (cutoff - timestamp(self.clock())).total_seconds()))
+                done, _ = await asyncio.wait({pending}, timeout=wait)
+                await flush()
+                if not done:
+                    continue
+                try:
+                    frame = pending.result()
+                except StopAsyncIteration:
+                    if summary["state"] != "failed":
+                        summary["state"] = "disconnected" if self.clock() < cutoff else "cutoff"
+                    break
+                finally:
+                    pending = None
+                count("frames")
+                for record in frame:
+                    count("receivedRecords")
+                    try:
+                        code = instrument(record["code"])["code"]
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        count("rejectedRecords")
+                        continue
+                    if code not in scope:
+                        count("outsideScopeRecords")
+                        continue
+                    meta = record.get("meta")
+                    evidence = record.get("unitEvidence") or (meta.get("unitEvidence") if isinstance(meta, dict) else None)
+                    if (record.get("transport") != "websocket" or record.get("volumeUnit") != "lot"
+                            or record.get("bookVolumeUnit") != "lot" or not evidence):
+                        count("unsupportedUnitRecords")
+                        continue
+                    try:
+                        row = self._validated_record(day, record, min(cutoff, timestamp(self.clock())))
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        count("rejectedRecords")
+                        continue
+                    key = (row["code"], row["asOf"], self._record_signature(row))
+                    if key in seen:
+                        seen.move_to_end(key)
+                        count("duplicateRecords")
+                        continue
+                    seen[key] = None
+                    if len(seen) > _STREAM_SEEN:
+                        seen.popitem(last=False)
+                    buffer.append(row)
+                    count("acceptedRecords")
+                    await flush()
+            if summary["state"] not in {"failed", "disconnected"}:
+                summary.update(state="cutoff", complete=True)
+        except asyncio.CancelledError:
+            summary.update(state="cancelled", complete=False)
+            raise
+        except (MeozError, MarketDataError) as exc:
+            summary.update(state="failed", error=str(exc), sourceStatus=getattr(exc, "status", "incomplete"), complete=False)
+        finally:
+            if pending is not None:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+            try:
+                if iterator is not None:
+                    await iterator.aclose()
+            finally:
+                try:
+                    await flush(True)
+                except MeozError as exc:
+                    summary.update(state="failed", error=str(exc), sourceStatus=getattr(exc, "status", "incomplete"), complete=False)
+                    # A replaced key cannot publish even a terminal health update.
+        return summary
+
+    @classmethod
+    def _validated_record(cls, day, record, limit):
+        row = deepcopy(record)
+        code = instrument(row["code"])["code"]
+        at, received = timestamp(row["asOf"]), timestamp(row["availableAt"])
+        raw = row["raw"]
+        if (at.strftime("%Y%m%d") != day or received.strftime("%Y%m%d") != day
+                or not "091500" <= at.strftime("%H%M%S") <= "092959"
+                or not at <= received <= min(timestamp(limit), cls._deadline(day))
+                or _day(raw.get("tradedate", day)) != day
+                or instrument(raw.get("symbol", code))["code"] != code
+                or ("time" in raw and timestamp(raw["time"]) != at)):
+            raise ValueError("tick outside causal auction window")
+        if row.get("sendAt") is not None:
+            sent = timestamp(row["sendAt"])
+            if not at <= sent <= received:
+                raise ValueError("invalid tick send time")
+        row.update(code=code, asOf=at.isoformat(), availableAt=received.isoformat())
+        _json(row)  # Reject unserializable/NaN wire facts, never invent replacements.
+        return row
+
+    @staticmethod
+    def _record_values(row, reference=0, default_unit="lot"):
+        # REST keeps its documented lots contract; a WS declaration is per-record.
+        unit = row.get("volumeUnit", None if row.get("transport") == "websocket" else default_unit)
+        book_unit = row.get("bookVolumeUnit", None if row.get("transport") == "websocket" else "lot")
+        meta = row.get("meta")
+        evidence = row.get("unitEvidence") or (meta.get("unitEvidence") if isinstance(meta, dict) else None)
+        if row.get("transport") == "websocket" and not evidence:
+            unit, book_unit = None, None
+        values = MeozProvider.auction_values(row["raw"], reference, volume_unit=unit)
+        for index, field in ((6, "bid_vol1"), (8, "bid_vol2"), (10, "ask_vol1"), (12, "ask_vol2")):
+            values[index] = number(row["raw"].get(field), math.nan) * (
+                100 if book_unit == "lot" else 1 if book_unit == "share" else math.nan)
+        return values
+
+    @classmethod
+    def _record_facts(cls, row):
+        facts = {k: number(row["raw"].get(k)) for k in _TICK_NUMBERS}
+        values = cls._record_values(row)
+        for field, index in (("vol", 2), ("bid_vol1", 6), ("bid_vol2", 8),
+                             ("ask_vol1", 10), ("ask_vol2", 12)):
+            facts[field] = number(values[index])
+        return facts
+
+    @classmethod
+    def _record_signature(cls, row):
+        return _json(cls._record_facts(row))
+
+    @classmethod
+    def _record_rank(cls, row):
+        known = sum(v is not None for v in cls._record_facts(row).values())
+        known += number(row["raw"].get("transaction_num")) is not None
+        return known, -timestamp(row["availableAt"]).timestamp()
+
+    @classmethod
+    def _data_conflict(cls, first, second):
+        left, right = cls._record_facts(first), cls._record_facts(second)
+        # Absent/unsupported fields are not evidence of contradictory facts.
+        return any(left[k] is not None and right[k] is not None and left[k] != right[k] for k in left)
+
+    @classmethod
+    def _observations(cls, code, day, saved, limit, *, final=False):
+        seen, conflict = {}, False
+        for row in saved.get("records", []):
+            if row.get("code") != code:
+                continue
+            try:
+                row = cls._validated_record(_day(day), row, limit)
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+            if final and timestamp(row["asOf"]).strftime("%H%M%S") < "092500":
+                continue
+            key = row["asOf"]
+            if key in seen:
+                conflict |= cls._data_conflict(seen[key], row)
+                if cls._record_rank(row) > cls._record_rank(seen[key]):
+                    seen[key] = row
+            else:
+                seen[key] = row
+        conflict |= any(r["code"] == code and timestamp(r["availableAt"]) <= timestamp(limit)
+                        and (not final or timestamp(r["asOf"]).strftime("%H%M%S") >= "092500")
+                        for r in saved.get("conflicts", []))
+        return sorted(seen.values(), key=lambda r: r["asOf"]), conflict
+
     def poll(self, day, now=None, holding_symbols=()):
         now, day = timestamp(now or self.clock()), _day(day)
         if now.strftime("%Y%m%d") != day or not "091500" <= now.strftime("%H%M%S") <= "092959":
@@ -589,16 +957,175 @@ class MeozAuctionSource:
             return False
 
     def _snapshot_merge(self, day, *, records=(), documents=(), **updates):
+        incoming = []
+        for row in records:
+            try:
+                incoming.append(self._validated_record(_day(day), row, min(self.clock(), self._deadline(day))))
+            except (KeyError, ValueError, TypeError, AttributeError):
+                raise MeozError("incomplete", "盘口时间或股票身份不在有效采集窗口") from None
+
         def merge(saved):
-            saved.setdefault("records", []).extend(deepcopy(records))
-            saved.setdefault("documents", []).extend(deepcopy(documents))
+            groups, by_time, count = {}, {}, 0
+            conflicts = {(r["code"], r["asOf"]): r for r in saved.get("conflicts", [])}
+            overflow = saved.setdefault("overflowSymbols", {})
+            old_records = saved.get("records", [])
+            for index, row in enumerate(old_records + incoming):
+                key = (row["code"], row["asOf"], bool(row.get("boundaryFinal")))
+                point = key[:2]
+                signature = self._record_signature(row)
+                group = groups.setdefault(key, [])
+                for previous in by_time.get(point, []):
+                    if self._data_conflict(previous, row):
+                        received = max(timestamp(previous["availableAt"]), timestamp(row["availableAt"])).isoformat()
+                        evidence = {"code": row["code"], "asOf": row["asOf"], "availableAt": received}
+                        left, right = self._record_facts(previous), self._record_facts(row)
+                        evidence["fields"] = {k: [left[k], right[k]] for k in left
+                                              if left[k] is not None and right[k] is not None and left[k] != right[k]}
+                        if point not in conflicts or received < conflicts[point]["availableAt"]:
+                            conflicts[point] = evidence
+                same = next((r for r in group if self._record_signature(r) == signature
+                             and self._record_rank(r)[0] == self._record_rank(row)[0]), None)
+                if same is not None:
+                    if timestamp(row["availableAt"]) < timestamp(same["availableAt"]):
+                        same.clear()
+                        same.update(deepcopy(row))
+                    continue
+                if count >= _SNAPSHOT_RECORDS and index >= len(old_records):
+                    overflow.setdefault(row["code"], row["availableAt"])
+                    if not group:
+                        groups.pop(key)
+                    continue
+                if len(group) < 2:
+                    item = deepcopy(row)
+                    group.append(item)
+                    by_time.setdefault(point, []).append(item)
+                    count += 1
+                else:
+                    # Keep earliest evidence and the richest real row; contradictions
+                    # survive separately even when a third variant is compacted out.
+                    if self._record_rank(row) > self._record_rank(group[1]):
+                        group[1].clear()
+                        group[1].update(deepcopy(row))
+            saved["records"] = [r for group in groups.values() for r in group]
+            # Legacy facts are not discarded solely to meet a new resource cap.
+            saved["conflicts"] = list(conflicts.values())
+            kept = {}
+            old_documents = saved.get("documents", [])
+            for index, document in enumerate(old_documents + list(documents)):
+                key = hashlib.sha256(_json([document.get("fields"), document.get("rows")]).encode()).hexdigest()
+                if key not in kept and len(kept) >= _SNAPSHOT_DOCUMENTS and index >= len(old_documents):
+                    saved["documentOverflow"] = True
+                    continue
+                if key not in kept or document.get("receivedAt", "") < kept[key].get("receivedAt", ""):
+                    kept[key] = deepcopy(document)
+            saved["documents"] = list(kept.values())
             saved.setdefault("lastPoll", None)
             saved.update(updates)
             return saved
         return self._change(day, "source_snapshot", merge, "failed" if updates.get("error") else "complete")
 
+    @classmethod
+    def _coverage(cls, rows):
+        pre = []
+        for row in rows:
+            if not 33300 <= row["time"] < 33900:
+                continue
+            bid, bid_qty, ask, ask_qty = [row["fields"][i] for i in (5, 6, 9, 10)]
+            if (bid is not None and bid > 0 and ask is not None and abs(bid - ask) < .00001
+                    and bid_qty is not None and bid_qty >= 0 and ask_qty is not None
+                    and abs(bid_qty - ask_qty) < .001):
+                pre.append(row["time"])
+        finals = [r for r in rows if 33900 <= r["time"] < 34200 and cls._valid_final(r["fields"])]
+        checkpoints = all(any(0 <= target - t <= 6 for t in pre) for target in (33600, 33840, 33890))
+        path = (checkpoints and bool(pre) and min(pre) <= 33306 and max(pre) >= 33890
+                and max((b - a for a, b in zip(pre, pre[1:], strict=False)), default=999) <= 6)
+        return pre, finals, checkpoints, path
+
+    def _tick_backfill(self, day, symbols, cutoff, budget):
+        """Resume one bounded full-Tick page, never synthesize books from auction details."""
+        if self.clock().strftime("%Y%m%d") != day or not "092600" <= self.clock().strftime("%H%M%S") <= "092959":
+            return
+        snapshot = self._read(day, "source_snapshot") or {}
+        missing = []
+        for code in symbols:
+            observations, conflict = self._observations(code, day, snapshot, min(self.clock(), cutoff))
+            rows = []
+            for record in observations:
+                at = timestamp(record["asOf"])
+                values = self._record_values(record)
+                rows.append({"time": at.hour * 3600 + at.minute * 60 + at.second + at.microsecond / 1_000_000,
+                             "fields": [v if math.isfinite(v) else None for v in values]})
+            _, finals, _, path = self._coverage(rows)
+            if not path or not finals or conflict:
+                missing.append(code)
+        saved = self._read(day, "source_tick_backfill") or {
+            "symbols": [], "batches": [], "batch": 0, "offset": 0, "pages": 0, "pageInBatch": 0}
+        extra = sorted(set(missing) - set(saved["symbols"]))
+        if extra:
+            saved["symbols"].extend(extra)
+            saved["batches"].extend(extra[start:start + 200] for start in range(0, len(extra), 200))
+        while saved["batch"] < len(saved["batches"]) and not set(saved["batches"][saved["batch"]]) & set(missing):
+            saved.update(batch=saved["batch"] + 1, offset=0, pageInBatch=0, error=None, sourceStatus=None)
+        saved["complete"] = saved["batch"] >= len(saved["batches"])
+        if saved["complete"]:
+            self._write(day, "source_tick_backfill", saved)
+            return
+        batch = saved["batches"][saved["batch"]]
+        try:
+            if saved["pageInBatch"] >= _BACKFILL_PAGES or saved["pages"] >= _BACKFILL_TOTAL_PAGES:
+                raise MeozError("incomplete", "全Tick分页上限已到，覆盖仍须核验")
+            with self.stage("tick-backfill", day=day):
+                remaining = min(3.0, budget(), (cutoff - self.clock()).total_seconds())
+                if remaining <= 0:
+                    raise MeozError("incomplete", "全Tick本轮预算已耗尽")
+                result = self.market.meoz_tick_history(day, batch, offset=saved["offset"],
+                    start_time="09:15:00", end_time="09:26:00", deadline=cutoff, budget_seconds=remaining)
+                try:
+                    received = timestamp(result["receivedAt"])
+                    if (received.strftime("%Y%m%d") != day or not received <= min(self.clock(), cutoff)
+                            or not isinstance(result["rows"], list) or not result["source"]):
+                        raise ValueError()
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    raise MeozError("incomplete", "全Tick补采缺少真实接收时间或来源") from None
+                if not set(TICK_FIELDS.split(",")) <= set(result.get("fields", [])):
+                    raise MeozError("unsupported_fields", "全Tick补采缺少真实盘口字段")
+                if len(result["rows"]) > 6000:
+                    raise MeozError("incomplete", "全Tick补采超过6000行分页契约")
+                records = []
+                for raw in result["rows"]:
+                    try:
+                        code = instrument(raw["symbol"])["code"]
+                        if code not in batch or raw["tradedate"] != day:
+                            raise ValueError()
+                        record = self._validated_record(day, {"code": code, "raw": raw,
+                            "asOf": raw["time"], "availableAt": result["receivedAt"],
+                            "source": result["source"], "transport": "rest", "volumeUnit": "lot",
+                            "bookVolumeUnit": "lot"}, min(self.clock(), cutoff))
+                        if timestamp(record["asOf"]) > self._deadline(day).replace(minute=26, second=0):
+                            raise ValueError()
+                    except (KeyError, ValueError, TypeError, AttributeError):
+                        raise MeozError("incomplete", "全Tick补采股票、时间或接收时间无效") from None
+                    records.append(record)
+                self._snapshot_merge(day, records=records)
+                saved.update(pages=saved["pages"] + 1, pageInBatch=saved["pageInBatch"] + 1,
+                             offset=saved["offset"] + len(result["rows"]), error=None, sourceStatus=None,
+                             lastPage={"fields": result["fields"], "source": result["source"],
+                                       "receivedAt": result["receivedAt"], "rowCount": len(result["rows"])})
+                if len(result["rows"]) < 6000:
+                    saved.update(batch=saved["batch"] + 1, offset=0, pageInBatch=0)
+                saved["complete"] = saved["batch"] >= len(saved["batches"])
+                self._write(day, "source_tick_backfill", saved, "complete" if saved["complete"] else "waiting")
+        except MeozError as exc:
+            saved.update(error=str(exc), sourceStatus=exc.status, complete=False)
+            try:
+                self._write(day, "source_tick_backfill", saved, "waiting")
+            except MeozError:
+                pass
+
     def _backfill(self, day, symbols, cutoff, budget):
-        """One ordinary detail page per poll, saved separately from actual order books."""
+        """Prefer real Tick backfill; legacy detail-only adapters remain diagnostic."""
+        if callable(getattr(self.market, "meoz_tick_history", None)):
+            return self._tick_backfill(day, symbols, cutoff, budget)
         saved = self._read(day, "source_details") or {"batch": 0, "offset": 0, "documents": []}
         if saved.get("symbols") != symbols:
             saved.update(symbols=list(symbols), batch=0, offset=0, complete=False)
@@ -649,29 +1176,29 @@ class MeozAuctionSource:
 
     @classmethod
     def _fetched_final(cls, code, day, saved, limit):
-        """Only proven after-09:25 requests can satisfy the final-fetch checkpoint."""
-        seen, boundary = {}, []
+        """Only proven after-09:25 REST requests satisfy the final-fetch checkpoint."""
+        _, conflict = cls._observations(code, day, saved, limit, final=True)
+        if conflict:
+            return False
         for row in saved.get("records", []):
-            if row["code"] != code:
+            if row.get("code") != code or not row.get("boundaryFinal"):
                 continue
-            at = timestamp(row["asOf"])
-            if (at.strftime("%Y%m%d") != _day(day) or not "092500" <= at.strftime("%H%M%S") < "093000"
-                    or not at <= timestamp(row["availableAt"]) <= limit):
+            try:
+                row = cls._validated_record(_day(day), row, limit)
+            except (KeyError, ValueError, TypeError, AttributeError):
                 continue
-            if row["asOf"] in seen and seen[row["asOf"]] != row["raw"]:
-                return False
-            seen.setdefault(row["asOf"], row["raw"])
-            if row.get("boundaryFinal"):
-                boundary.append(row)
-        return any(cls._valid_final(MeozProvider.auction_values(row["raw"], 0, volume_unit="lot"))
-                   for row in boundary)
+            if timestamp(row["asOf"]).strftime("%H%M%S") >= "092500" and cls._valid_final(cls._record_values(row)):
+                return True
+        return False
 
     @classmethod
     def _matched_final(cls, fields, code, day, documents, limit):
         if not cls._valid_final(fields):
             return False
         for doc in documents:
-            if timestamp(doc["receivedAt"]) > limit:
+            received = timestamp(doc["receivedAt"])
+            if (received.strftime("%Y%m%d") != _day(day) or received.strftime("%H%M%S") < "092500"
+                    or received > min(timestamp(limit), cls._deadline(day))):
                 continue
             for row in doc["rows"]:
                 if row.get("symbol") != code[2:] or row.get("tradedate", _day(day)) != _day(day):
@@ -686,20 +1213,15 @@ class MeozAuctionSource:
 
     @classmethod
     def _collected_final(cls, code, day, saved, limit):
-        seen = {}
-        for row in saved["records"]:
-            at = timestamp(row["asOf"])
-            if (row["code"] != code or at.strftime("%Y%m%d") != _day(day)
-                    or not "092500" <= at.strftime("%H%M%S") < "093000"
-                    or not at <= timestamp(row["availableAt"]) <= limit):
+        observations, conflict = cls._observations(code, day, saved, limit, final=True)
+        if conflict:
+            return False
+        for row in observations:
+            if timestamp(row["asOf"]).strftime("%H%M%S") < "092500":
                 continue
-            if row["asOf"] in seen and seen[row["asOf"]]["raw"] != row["raw"]:
-                return False
-            seen.setdefault(row["asOf"], row)
-        for row in sorted(seen.values(), key=lambda r: r["asOf"]):
-            values = MeozProvider.auction_values(row["raw"], 0, volume_unit="lot")
+            values = cls._record_values(row)
             if cls._valid_final(values):
-                return cls._matched_final(values, code, day, saved["documents"], limit)
+                return cls._matched_final(values, code, day, saved.get("documents", []), limit)
         return False
 
     def inspect(self, day, cutoff, volume_unit="lot"):
@@ -730,53 +1252,38 @@ class MeozAuctionSource:
                                   "details": (prepared or {}).get("progress", {}).get("gaps", {})}]
                 return result
             unit = inspection_unit or "lot"
-            limit = timestamp(cutoff)
+            limit = min(timestamp(cutoff), self._deadline(day))
             candidates = deepcopy(prepared["candidates"])
-            complete = state["ready"] and not saved.get("error") and bool(candidates or prepared.get("documents"))
+            complete = (state["ready"] and not saved.get("error") and not saved.get("documentOverflow")
+                        and bool(candidates or prepared.get("documents")))
             gaps = []
             for c in candidates:
-                records = [r for r in saved["records"] if r["code"] == c["code"]
-                           and timestamp(r["asOf"]) <= limit and timestamp(r["availableAt"]) <= limit]
-                seen = {}
-                conflict = False
-                for r in records:
-                    key = r["asOf"]
-                    if key in seen and seen[key]["raw"] != r["raw"]:
-                        conflict = True
-                    else:
-                        seen.setdefault(key, r)
-                rows = []
-                for r in sorted(seen.values(), key=lambda r: r["asOf"]):
+                observations, conflict = self._observations(c["code"], day, saved, limit)
+                rows, unsupported = [], set()
+                for r in observations:
                     t = timestamp(r["asOf"])
-                    values = MeozProvider.auction_values(r["raw"], c["reference"] / 100, volume_unit=unit)
-                    rows.append({"time": t.hour * 3600 + t.minute * 60 + t.second,
+                    values = self._record_values(r, c["reference"] / 100, default_unit=unit)
+                    rows.append({"time": t.hour * 3600 + t.minute * 60 + t.second + t.microsecond / 1_000_000,
                         "fields": [v if math.isfinite(v) else None for v in values], "receivedAt": r["availableAt"]})
+                    required = {5: "bid1", 6: "bid_vol1", 9: "ask1", 10: "ask_vol1"} if t.strftime("%H%M%S") < "092500" else {
+                        1: "close", 2: "vol", 3: "amount"}
+                    unsupported.update(field for index, field in required.items() if not math.isfinite(values[index]))
                 c["auctionRows"] = rows
-                # Contract for virtual matched books, before checkpoint coverage:
-                # snapshots are valid only when both matched sides agree.
-                pre = []
-                for row in rows:
-                    if not 33300 <= row["time"] < 33900:
-                        continue
-                    bid, bid_qty, ask, ask_qty = [row["fields"][i] for i in (5, 6, 9, 10)]
-                    if (bid is not None and bid > 0 and ask is not None and abs(bid - ask) < .00001
-                            and bid_qty is not None and bid_qty >= 0 and ask_qty is not None
-                            and abs(bid_qty - ask_qty) < .001):
-                        pre.append(row["time"])
-                finals = [r for r in rows if 33900 <= r["time"] < 34200 and self._valid_final(r["fields"])]
-                checkpoints = all(any(0 <= target - t <= 6 for t in pre) for target in (33600, 33840, 33890))
-                path = checkpoints
-                path = path and bool(pre) and min(pre) <= 33306 and max(pre) >= 33890
-                path = path and max((b - a for a, b in zip(pre, pre[1:], strict=False)), default=999) <= 6
+                pre, finals, checkpoints, path = self._coverage(rows)
+                overflow = c["code"] in saved.get("overflowSymbols", {}) and timestamp(
+                    saved["overflowSymbols"][c["code"]]) <= limit
                 matched = bool(finals) and self._matched_final(
                     finals[0]["fields"], c["code"], day, saved["documents"], limit)
-                c["coverageComplete"] = not conflict and path and matched
-                c["verification"] = {"checkpointsVerified": not conflict and checkpoints,
-                    "coverageVerified": not conflict and path, "volumeVerified": not conflict and matched,
+                c["coverageComplete"] = not conflict and not overflow and path and matched
+                c["verification"] = {"checkpointsVerified": not conflict and not overflow and checkpoints,
+                    "coverageVerified": not conflict and not overflow and path, "volumeVerified": not conflict and matched,
                     "finalAuctionVerified": not conflict and bool(finals) and matched}
                 if not c["coverageComplete"]:
-                    gaps.append({"code": c["code"], "kind": "bookCoverage", "recoverable": False,
-                        "conflict": conflict, "startCovered": bool(pre) and min(pre) <= 33306,
+                    gaps.append({"code": c["code"], "kind": "unsupportedFields" if unsupported and not path else "bookCoverage",
+                        "recoverable": (not conflict and not overflow
+                            and callable(getattr(self.market, "meoz_tick_history", None))
+                            and self.clock() < self._deadline(day)), "unsupportedFields": sorted(unsupported),
+                        "conflict": conflict, "overflow": bool(overflow), "startCovered": bool(pre) and min(pre) <= 33306,
                         "endCovered": bool(pre) and max(pre) >= 33890, "finalMatched": matched,
                         "checkpointsMissing": [target for target in (33600, 33840, 33890)
                                                if not any(0 <= target - t <= 6 for t in pre)],
@@ -834,19 +1341,12 @@ class MeozAuctionSource:
         cutoff = datetime.strptime(day + "092959", "%Y%m%d%H%M%S").replace(tzinfo=CN)
         # Only locally received pre-open facts may drive the overnight waiting rule.
         saved = self._read(day, "source_snapshot") or {}
-        rows = [r for r in saved.get("records", []) if r["code"] == code
-                and timestamp(r["asOf"]).strftime("%Y%m%d") == day
-                and timestamp(r["asOf"]).strftime("%H%M%S") >= "092500"
-                and timestamp(r["asOf"]) <= timestamp(r["availableAt"]) <= cutoff]
-        if not rows:
+        observations, conflict = self._observations(code, day, saved, cutoff, final=True)
+        rows = [r for r in observations if timestamp(r["asOf"]).strftime("%H%M%S") >= "092500"]
+        if not rows or conflict:
             return {"complete": False, "auctionPrice": None, "buyClose": None}
-        seen = {}
-        for row in rows:
-            if row["asOf"] in seen and seen[row["asOf"]]["raw"] != row["raw"]:
-                return {"complete": False, "auctionPrice": None, "buyClose": None}
-            seen.setdefault(row["asOf"], row)
-        final = min(rows, key=lambda r: r["asOf"])
-        values = MeozProvider.auction_values(final["raw"], 0, volume_unit="lot")
+        final = rows[0]
+        values = self._record_values(final)
         if not self._matched_final(values, code, day, saved.get("documents", []), cutoff):
             return {"complete": False, "auctionPrice": None, "buyClose": None}
         buy = datetime.strptime(buy_date, "%Y%m%d").replace(tzinfo=CN)

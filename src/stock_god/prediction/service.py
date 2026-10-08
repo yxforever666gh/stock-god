@@ -46,6 +46,7 @@ class PredictionService:
         self._tasks, self._chart_locks, self._chart_cache = {}, {}, {}
         self._last_email = None
         self._publication_token = object()
+        self._stream_state, self._stream_closed = None, False
         self.evidence_store = evidence_store
 
     def _snapshot(self):
@@ -74,6 +75,9 @@ class PredictionService:
     def on_settings_changed(self, before, after):
         previous = before.config if hasattr(before, "config") else before
         config = after.config if hasattr(after, "config") else after
+        if (self._stream_key(previous) != self._stream_key(config)
+                or not config.get("predictionAutoEnabled", True)):
+            self._stop_stream()
         now = local(self.clock())
         if not config.get("predictionAutoEnabled", True):
             self._publication_token = object()
@@ -141,6 +145,15 @@ class PredictionService:
     @staticmethod
     def _source_key(config):
         return hashlib.sha256(config.get("meozApiKey", "").strip().encode()).hexdigest()
+
+    @staticmethod
+    def _stream_key(config):
+        # Match the injected source's credential/transport identity, not unrelated UI settings.
+        fields = ("meozApiKey", "tushareToken", "crawlTimeOut", "httpProxyEnabled",
+                  "httpProxy", "forceNoProxyForFetch")
+        identity = {name: config.get(name) for name in fields}
+        identity["meozApiKey"] = config.get("meozApiKey", "").strip()
+        return hashlib.sha256(json_text(identity).encode()).hexdigest()
 
     def _prepare_due(self, day, now, config):
         with self.database.connection() as con:
@@ -587,11 +600,97 @@ class PredictionService:
         self._tasks[key] = task
 
         def done(completed):
-            self._tasks.pop(key, None)
+            if self._tasks.get(key) is completed:
+                self._tasks.pop(key, None)
             if not completed.cancelled() and completed.exception():
                 log.error("prediction task %s failed", key, exc_info=completed.exception())
 
         task.add_done_callback(done)
+
+    @staticmethod
+    def _revoke_stream(state):
+        # Sources with buffered/threaded merges must revoke them synchronously, before drain.
+        revoke = getattr(state["source"], "revoke", None)
+        if callable(revoke):
+            try:
+                revoke()
+            except Exception:
+                log.error("auction stream revocation failed; provider details suppressed")
+
+    def _stop_stream(self):
+        state = self._stream_state
+        if state is not None and not state["cancelled"].is_set():
+            state["cancelled"].set()
+            self._revoke_stream(state)
+        task = self._tasks.get("auction-stream")
+        if task is not None and not task.done() and not task.cancelling():
+            task.cancel()
+
+    def _stream_tick(self, now, config):
+        day, identity = now.date().isoformat(), self._stream_key(config)
+        start = now.replace(hour=9, minute=14, second=30, microsecond=0)
+        deadline = now.replace(hour=9, minute=29, second=59, microsecond=0)
+        eligible = (not self._stream_closed and start <= now < deadline
+                    and config.get("predictionAutoEnabled", True)
+                    and bool(config.get("meozApiKey", "").strip())
+                    and callable(getattr(self.auction_source, "capture_stream", None)))
+        state, task = self._stream_state, self._tasks.get("auction-stream")
+        if task is not None:
+            if not eligible or state is None or state["day"] != day or state["identity"] != identity:
+                self._stop_stream()
+            if not task.done():
+                return  # Keep the old task registered through cancellation/close; never overlap leases.
+        if not eligible:
+            return
+        if (state is None or state["day"] != day or state["identity"] != identity
+                or state["cancelled"].is_set()):
+            state = {"day": day, "identity": identity, "cancelled": asyncio.Event(),
+                     "source": None, "attempts": 0, "last": None, "terminal": False}
+            self._stream_state = state
+        if (state["terminal"] or state["attempts"] >= 3
+                or (state["last"] is not None and (now - state["last"]).total_seconds() < 30)):
+            return
+        state["attempts"] += 1
+        state["last"] = now
+        self._launch("auction-stream", self._capture_stream(now, config, state))
+
+    async def _capture_stream(self, now, config, state):
+        deadline = now.replace(hour=9, minute=29, second=59, microsecond=0)
+        # Revoke before cancellation reaches buffered merges; no second worker or tick is needed.
+        timer = asyncio.get_running_loop().call_later(
+            max(0, (deadline - local(self.clock())).total_seconds()), self._stop_stream
+        )
+        try:
+            with self._source(config) as source:
+                state["source"] = source
+                try:
+                    if (source is None or not callable(getattr(source, "capture_stream", None))
+                            or not source.status().get("configured", False)):
+                        state["terminal"] = True
+                        return
+                    with self._provider(config) as market:
+                        trading = await asyncio.to_thread(market.is_trading_day, now)
+                    if not trading:
+                        state["terminal"] = True
+                        return
+                    if state["cancelled"].is_set() or local(self.clock()) >= deadline:
+                        return
+                    holdings = self.repo.rows(
+                        "recommendations", "slot=? AND status IN ('active','sell_pending')", (DEFAULT_SLOT,)
+                    )
+                    result = await source.capture_stream(
+                        state["day"], holding_symbols=tuple(sorted({r["stock_code"] for r in holdings}))
+                    )
+                    state["terminal"] = not (isinstance(result, dict)
+                        and result.get("state") in {"failed", "disconnected"}
+                        and result.get("sourceStatus") not in {"no_permission", "unconfigured"})
+                finally:
+                    self._revoke_stream(state)
+                    state["source"] = None
+        except Exception:
+            log.error("auction stream capture failed; provider details suppressed")
+        finally:
+            timer.cancel()
 
     async def _scheduled_freeze(self, now):
         try:
@@ -614,6 +713,7 @@ class PredictionService:
         day = now.date().isoformat()
         snapshot = self._snapshot()
         enabled = snapshot.config.get("predictionAutoEnabled", True)
+        self._stream_tick(now, snapshot.config)
         if now.weekday() < 5:
             if (
                 now.replace(hour=9, minute=0, second=0, microsecond=0) <= now
@@ -652,9 +752,12 @@ class PredictionService:
                 self._launch("email", self.deliver_emails(now))
 
     async def close(self):
+        self._stream_closed = True
+        self._stop_stream()
         tasks = list(self._tasks.values())
         for task in tasks:
-            task.cancel()
+            if not task.cancelling():
+                task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
