@@ -22,10 +22,23 @@ test('slot labels show only buy execution', () => {
   assert.equal(predictionSlotBuyLabel(), '买入：等待报告')
 })
 
- test('MeoZ state blocks buys until authenticated and verified', () => {
+test('MeoZ state blocks buys until configured daily inputs are verified', () => {
   for (const status of ['unconfigured', 'unauthorized', 'unverified', 'incomplete', 'error']) {
     assert.match(predictionSlotBuyLabel({slot: 'base43', auctionSourceConfigured: true, auctionSourceStatus: status}), /未执行选股/)
   }
   assert.equal(predictionSlotBuyLabel({slot: 'base43', auctionSourceConfigured: true, auctionSourceStatus: 'ready', buyStatus: 'awaiting_quote'}), '买入：等待行情')
   assert.equal(predictionSlotBuyLabel({slot: 'base43', auctionSourceStatus: 'error', auctionSourceMessage: '提供者暂不可用'}), '提供者暂不可用')
+})
+
+test('collection stage and elapsed time remain intact while preparation waits', () => {
+  const message = 'minute: 前日分钟覆盖不足；资格/历史已完成3/68只；请求累计33.36秒'
+  assert.equal(predictionSlotBuyLabel({slot: 'base43', auctionSourceConfigured: true,
+    auctionSourceStatus: 'incomplete', auctionSourceMessage: message, buyStatus: 'processing'}), message)
+})
+
+test('cutoff and unrecoverable input details take precedence over pending buy labels', () => {
+  const message = '当日竞价覆盖或单位核验未通过；请求累计33.36秒；已截止，缺口不补发买单'
+  assert.equal(predictionSlotBuyLabel({slot: 'base43', auctionSourceConfigured: true,
+    auctionSourceStatus: 'incomplete', auctionSourceMessage: message, buyStatus: 'awaiting_quote',
+    pendingBuyCount: 2}), message)
 })

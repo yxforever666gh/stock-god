@@ -7,8 +7,9 @@ import copy
 import hashlib
 import json
 import logging
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
+from typing import cast
 
 from .base43 import Base43Models, feature_candidate
 from .core import DEFAULT_SLOT, Conflict, PredictionError, json_text, local, next_session, positive, stamp
@@ -159,6 +160,11 @@ class PredictionService:
                 return at.date().isoformat()
         raise PredictionError("缺少前交易日")
 
+    @staticmethod
+    def _stage(source, name) -> AbstractContextManager[None]:
+        stage = getattr(source, "stage", None)
+        return cast(AbstractContextManager[None], stage(name)) if callable(stage) else nullcontext()
+
     async def prepare_day(self, now=None):
         now = local(now or self.clock())
         day = now.date().isoformat()
@@ -173,24 +179,35 @@ class PredictionService:
             if self._source_key(self._snapshot().config) == key:
                 self._task(day, "prepare", status, {"keyFingerprint": key}, error, guard_key=key)
 
+        phase = "source"
         try:
             with self._provider(snapshot.config) as market:
-                if not await asyncio.to_thread(market.is_trading_day, now):
-                    finish("blocked", "非交易日")
-                    return
-                await asyncio.to_thread(self.models.prepare, day)
                 with self._source(snapshot.config) as source:
                     if source is None:
                         finish("blocked", "竞价来源未配置")
                         return
-                    previous = await asyncio.to_thread(self._previous, market, now)
+                    with self._stage(source, "calendar"):
+                        trading = await asyncio.to_thread(market.is_trading_day, now)
+                    if not trading:
+                        finish("blocked", "非交易日")
+                        return
                     try:
+                        mother = getattr(source, "collect_mother", None)
+                        if callable(mother):
+                            await asyncio.to_thread(mother, day)
+                        with self._stage(source, "calendar"):
+                            previous = await asyncio.to_thread(self._previous, market, now)
                         prepared = await asyncio.to_thread(source.prepare, day, previous)
                     except Exception:
-                        finish("blocked" if local(self.clock()) >= deadline else "waiting",
+                        state = source.status()
+                        terminal = state.get("status") in ("unconfigured", "unauthorized", "no_permission", "error")
+                        finish("blocked" if terminal or local(self.clock()) >= deadline else "waiting",
                                "竞价来源暂不可用，等待重新准备")
                         log.error("BASE43 source preparation unavailable; provider details suppressed")
                         return
+                    phase = "model"
+                    with self._stage(source, "model"):
+                        await asyncio.to_thread(self.models.prepare, day)
                     if not prepared.get("complete"):
                         state = prepared.get("sourceStatusJson", {})
                         terminal = state.get("status") in ("unconfigured", "unauthorized", "no_permission", "error")
@@ -199,7 +216,9 @@ class PredictionService:
                         return
             finish("success")
         except Exception:
-            finish("failed", "BASE43盘前准备失败")
+            status = "failed" if phase == "model" else (
+                "blocked" if local(self.clock()) >= deadline else "waiting")
+            finish(status, "BASE43模型准备失败" if phase == "model" else "BASE43盘前资料暂不可用")
             log.error("BASE43 preparation failed; provider details suppressed")
 
     async def analyze(self, scheduled_for=None, *, diagnostic=False, parent_run_id=None):
@@ -278,9 +297,10 @@ class PredictionService:
                     await asyncio.to_thread(
                         self.models.record_candidate, day, candidate["code"], vector, candidate
                     )
-                scores = (
-                    await asyncio.to_thread(self.models.predict, vectors, model_snapshot) if vectors else []
-                )
+                with self._stage(source, "scoring"):
+                    scores = (
+                        await asyncio.to_thread(self.models.predict, vectors, model_snapshot) if vectors else []
+                    )
                 items = [
                     dict(
                         stock_code=c["code"],
@@ -550,6 +570,11 @@ class PredictionService:
             (DEFAULT_SLOT,),
         )
         with self.database.transaction() as con:
+            con.execute(
+                "UPDATE research2_base43_daily_tasks SET status='waiting',completed_at=?,"
+                "error='服务重启，按已保存缺口继续准备' WHERE status='running' AND task_type='prepare'",
+                (stamp(now),),
+            )
             con.execute(
                 "UPDATE research2_base43_daily_tasks SET status='failed',error='服务重启时任务中断' WHERE status='running' AND task_type NOT LIKE 'source%'"
             )
